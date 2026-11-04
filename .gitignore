@@ -6,3 +6,5 @@ node_modules/
 .env
 .env.*
 .DS_Store
+fnox.local.toml
+.fnox.local.toml
