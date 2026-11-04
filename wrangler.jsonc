@@ -7,7 +7,7 @@
   "triggers": { "crons": ["*/5 * * * *"] },
   "kv_namespaces": [
     // Replace with the id printed by `wrangler kv namespace create STATE`.
-    { "binding": "STATE", "id": "00000000000000000000000000000000" }
+    { "binding": "STATE", "id": "5fbe5cd8f1b04d759e01d253bda4838f" }
   ],
   "vars": {
     "REMIND_AFTER_MIN": "60",
