@@ -1,4 +1,4 @@
-import { createScheduledController, reset } from "cloudflare:test";
+import { createScheduledController, reset, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
@@ -93,20 +93,18 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-type Kv = Pick<KVNamespace, "get" | "put" | "delete">;
-
 function bindings(overrides: Record<string, unknown> = {}): Env {
   return { ...env, ...overrides } as Env;
 }
 
-function countingKv() {
-  const writes: string[] = [];
-  const kv: Kv = {
-    get: ((key: string) => env.STATE.get(key)) as KVNamespace["get"],
-    put: ((key: string, value: string) => (writes.push(`put ${key}`), env.STATE.put(key, value))) as KVNamespace["put"],
-    delete: (key: string) => (writes.push(`delete ${key}`), env.STATE.delete(key)),
-  };
-  return { writes, env: bindings({ STATE: kv }) };
+const keeper = () => env.WATCH.getByName("watch");
+
+function breakStorage(method: "get" | "put" | "delete") {
+  return runInDurableObject(keeper(), (_, state) => {
+    vi.spyOn(state.storage.kv, method).mockImplementation(() => {
+      throw new Error(`storage ${method} failed`);
+    });
+  });
 }
 
 async function checkAt(minutes: number, e: Env = bindings()) {
@@ -119,7 +117,7 @@ async function request(minutes: number, method: string, url: string, init: Reque
   return worker.fetch(new Request(url, { method, ...init }), e);
 }
 
-const stored = () => env.STATE.get<Record<string, unknown>>("state", "json");
+const stored = () => keeper().watch() as Promise<Record<string, unknown> | null>;
 const events = () => world.webhooks.map((w) => w.payload.event);
 const lastPayload = () => world.webhooks.at(-1)!.payload;
 
@@ -132,11 +130,9 @@ async function remindedFromMinute0() {
 }
 
 describe("normal flow", () => {
-  it("writes nothing while protection is on and nothing is stored", async () => {
-    const { writes, env: e } = countingKv();
-    await checkAt(0, e);
-    await checkAt(5, e);
-    expect(writes).toEqual([]);
+  it("stores and sends nothing while protection is on", async () => {
+    await checkAt(0);
+    await checkAt(5);
     expect(await stored()).toBeNull();
     expect(world.webhooks).toEqual([]);
     expect(world.puts).toEqual([]);
@@ -150,13 +146,12 @@ describe("normal flow", () => {
     expect(await stored()).toBeNull();
   });
 
-  it("records off_since the first time protection is off, then writes nothing until a reminder is due", async () => {
+  it("records off_since the first time protection is off, then keeps it until a reminder is due", async () => {
     world.setOff("d1");
-    const { writes, env: e } = countingKv();
-    await checkAt(0, e);
+    await checkAt(0);
     expect(await stored()).toEqual({ phase: "off", offSince: T0 });
-    for (const minute of [5, 30, 55]) await checkAt(minute, e);
-    expect(writes).toEqual(["put state"]);
+    for (const minute of [5, 30, 55]) await checkAt(minute);
+    expect(await stored()).toEqual({ phase: "off", offSince: T0 });
     expect(world.webhooks).toEqual([]);
   });
 
@@ -355,10 +350,10 @@ describe("fail-safe", () => {
     },
   );
 
-  it("turns protection on when the KV read throws while protection is off", async () => {
+  it("turns protection on when the storage read throws while protection is off", async () => {
     world.setOff("d1");
-    const kv: Kv = { ...countingKv().env.STATE, get: (() => Promise.reject(new Error("KV down"))) as KVNamespace["get"] };
-    await checkAt(0, bindings({ STATE: kv }));
+    await breakStorage("get");
+    await checkAt(0);
     expect(world.puts).toEqual(["devices/d1"]);
     expect(lastPayload()).toEqual({
       event: "auto_enabled",
@@ -367,25 +362,33 @@ describe("fail-safe", () => {
     });
   });
 
-  it("turns protection on when the KV write throws while protection is off", async () => {
+  it("turns protection on when the storage write throws while protection is off", async () => {
     world.setOff("d1");
-    const kv: Kv = { ...countingKv().env.STATE, put: () => Promise.reject(new Error("KV write limit")) };
-    await checkAt(0, bindings({ STATE: kv }));
+    await breakStorage("put");
+    await checkAt(0);
     expect(world.puts).toEqual(["devices/d1"]);
     expect(world.isOn("d1")).toBe(true);
   });
 
+  it("turns protection on when the Durable Object can't be reached", async () => {
+    world.setOff("d1");
+    const unreachable = { getByName: () => ({ check: () => Promise.reject(new Error("Durable Object overloaded")) }) };
+    await checkAt(0, bindings({ WATCH: unreachable }));
+    expect(world.puts).toEqual(["devices/d1"]);
+    expect(lastPayload()).toMatchObject({ event: "auto_enabled", off: [{ id: "d1" }] });
+  });
+
   it("turns protection on after an unexpected error such as corrupt stored state", async () => {
     world.setOff("d1");
-    await env.STATE.put("state", "{not json");
+    await runInDurableObject(keeper(), (_, state) => state.storage.kv.put("watch", "{not json"));
     await checkAt(0);
     expect(world.puts).toEqual(["devices/d1"]);
     expect(events()).toEqual(["auto_enabled"]);
   });
 
-  it("does nothing on a KV failure while everything is on", async () => {
-    const kv: Kv = { ...countingKv().env.STATE, get: (() => Promise.reject(new Error("KV down"))) as KVNamespace["get"] };
-    await checkAt(0, bindings({ STATE: kv }));
+  it("does nothing on a storage failure while everything is on", async () => {
+    await breakStorage("get");
+    await checkAt(0);
     expect(world.puts).toEqual([]);
     expect(world.webhooks).toEqual([]);
   });
@@ -475,9 +478,7 @@ describe("fail-safe", () => {
     world.setOff("d1");
     await checkAt(0);
     world.adguardDown = true;
-    const { writes, env: e } = countingKv();
-    await expect(checkAt(65, e)).resolves.toBeUndefined();
-    expect(writes).toEqual([]);
+    await expect(checkAt(65)).resolves.toBeUndefined();
     expect(await stored()).toEqual({ phase: "off", offSince: T0 });
     expect(world.webhooks).toEqual([]);
   });

@@ -18,7 +18,16 @@ export async function readSwitches(adguard: AdGuard): Promise<Switch[]> {
   ];
 }
 
-export async function enableProtection(adguard: AdGuard, target: Switch): Promise<void> {
+export async function enableAll(adguard: AdGuard, off: Switch[]): Promise<Switch[]> {
+  const results = await Promise.allSettled(off.map((s) => enableProtection(adguard, s)));
+  return off.filter((s, i) => {
+    const result = results[i];
+    if (result?.status === "rejected") console.error(`Could not turn on protection for ${s.kind} ${s.id}`, result.reason);
+    return result?.status === "fulfilled";
+  });
+}
+
+async function enableProtection(adguard: AdGuard, target: Switch): Promise<void> {
   const collection = target.kind === "server" ? "dns_servers" : "devices";
   const res = await fetch(`${BASE}/v1/${collection}/${encodeURIComponent(target.id)}/settings`, {
     method: "PUT",
