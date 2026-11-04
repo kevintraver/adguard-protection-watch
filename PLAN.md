@@ -281,6 +281,8 @@ These were tested against a real AdGuard DNS account (one server, three devices)
 
 **Resolved: KV consistency.** KV takes up to 60 seconds to sync between locations. A snooze sent within about a minute of a reminder could reach a location that hadn't seen the reminder yet. It then got a 410 and the snooze was lost (fail-safe: protection turned on as if there were no reply). Seen live: a probe 30 seconds after a reminder got 410, while the bot's snooze 43 seconds after got through. The state now lives in a Durable Object, which has a single owner and strong consistency.
 
+**Durable Object end-to-end run (2026-11-04, 5-minute test timers):** the device was turned off at 11:28. The 11:30 check recorded it and the 11:35 check sent a reminder. The bot's snooze landed **31 seconds** after the reminder and got HTTP 200. That's the window where KV used to lose snoozes. The 11:40 check stayed quiet (snoozed until 11:40:54), and 11:45 sent a new reminder. With no reply, the 11:50 check turned the device on and sent `auto_enabled`. The canary confirmed filtering was live.
+
 ## Build steps
 
 1. ~~Check what the bot's webhook expects, and confirm the server and device toggles in the API.~~ Done (see Verified).
