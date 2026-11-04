@@ -429,9 +429,12 @@ describe("fail-safe", () => {
     expect(lastPayload()).toMatchObject({ event: "auto_enabled", off: [{ id: "d1" }] });
   });
 
-  it("turns protection on after an unexpected error such as corrupt stored state", async () => {
+  it.each([
+    ["not a watch at all", "{not json"],
+    ["a snooze with no valid end", { phase: "snoozed", offSince: T0, snoozeUntil: "tomorrow" }],
+  ])("turns protection on when the stored state is corrupt (%s)", async (_, value) => {
     world.setOff("d1");
-    await runInDurableObject(keeper(), (_, state) => state.storage.kv.put("watch", "{not json"));
+    await runInDurableObject(keeper(), (_, state) => state.storage.kv.put("watch", value));
     await checkAt(0);
     expect(world.puts).toEqual(["devices/d1"]);
     expect(events()).toEqual(["auto_enabled"]);
