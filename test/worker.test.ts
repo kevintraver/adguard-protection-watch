@@ -25,6 +25,9 @@ class World {
   webhookResponse: "ok" | "500" | "network error" = "ok";
   puts: string[] = [];
   webhooks: { url: string; auth: string | null; payload: any }[] = [];
+  onWebhook: ((payload: any) => Promise<void>) | null = null;
+  slowMs: Partial<Record<string, number>> = {};
+  started: string[] = [];
 
   setOff(id: string, off = true) {
     const toggle = [...this.servers, ...this.devices].find((t) => t.id === id);
@@ -39,13 +42,18 @@ class World {
   async handle(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.origin === "https://bot.test" || url.origin === "https://bot2.test") {
-      this.webhooks.push({ url: url.href, auth: request.headers.get("authorization"), payload: await request.json() });
+      const payload = await request.json();
+      this.webhooks.push({ url: url.href, auth: request.headers.get("authorization"), payload });
+      await this.onWebhook?.(payload);
       if (this.webhookResponse === "network error") throw new TypeError("network connection lost");
       return new Response(null, { status: this.webhookResponse === "ok" ? 200 : 500 });
     }
     if (url.origin !== "https://api.adguard-dns.io") throw new Error(`unexpected request to ${url.href}`);
     if (request.headers.get("authorization") !== "ApiKey test-api-key") return new Response(null, { status: 401 });
     if (this.adguardDown) return new Response("upstream error", { status: 503 });
+    this.started.push(request.method);
+    const slowMs = this.slowMs[request.method];
+    if (slowMs) await new Promise((resolve) => setTimeout(resolve, slowMs));
 
     const list = (items: object[]) => {
       const start = Number(url.searchParams.get("cursor") ?? 0);
@@ -250,6 +258,49 @@ describe("normal flow", () => {
       { url: "https://bot.test/hook", auth: "Bearer secret" },
       { url: "https://bot2.test/other", auth: "Bearer secret" },
     ]);
+  });
+});
+
+describe("concurrency", () => {
+  it("accepts a snooze sent while the reminder webhook is still being delivered", async () => {
+    world.setOff("d1");
+    await checkAt(0);
+    let status = 0;
+    world.onWebhook = async (payload) => {
+      status = (await request(60, "POST", `${payload.snooze.url}&minutes=20`)).status;
+    };
+    await checkAt(60);
+    expect(status).toBe(200);
+    expect(await stored()).toEqual({ phase: "snoozed", offSince: T0, snoozeUntil: T0 + 80 * MIN });
+    await checkAt(65);
+    expect(world.puts).toEqual([]);
+  });
+
+  it("snoozes, with no turn-on, when the snooze lands while the due check reads AdGuard", async () => {
+    const reminder = await remindedFromMinute0();
+    world.slowMs.GET = 300;
+    world.started = [];
+    const checking = checkAt(65);
+    await vi.waitUntil(() => world.started.includes("GET"));
+    const res = await request(65, "POST", reminder.snooze.url);
+    await checking;
+    expect(res.status).toBe(200);
+    expect(world.puts).toEqual([]);
+    expect(events()).toEqual(["reminder"]);
+    expect(await stored()).toMatchObject({ phase: "snoozed" });
+  });
+
+  it("turns protection on and refuses the snooze with 410 when the snooze lands during the turn-on", async () => {
+    const reminder = await remindedFromMinute0();
+    world.slowMs.PUT = 300;
+    const checking = checkAt(65);
+    await vi.waitUntil(() => world.started.includes("PUT"));
+    const res = await request(65, "POST", reminder.snooze.url);
+    await checking;
+    expect(res.status).toBe(410);
+    expect(world.puts).toEqual(["devices/d1"]);
+    expect(events()).toEqual(["reminder", "auto_enabled"]);
+    expect(await stored()).toBeNull();
   });
 });
 

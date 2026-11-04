@@ -8,8 +8,16 @@ const KEY = "watch";
 
 export class WatchKeeper extends DurableObject<Env> {
   async check(settings: Settings, off: Switch[], now: number): Promise<void> {
-    const payload = await transition(this.ctx.storage.kv, settings, off, now);
-    if (payload) await notify(settings.webhook, payload);
+    // Snoozes wait for the turn-on PUTs, so none can succeed for a reminder that is about to be cleared.
+    // A throw inside the block would reset the object, so the error is rethrown after it.
+    const outcome = await this.ctx.blockConcurrencyWhile(() =>
+      transition(this.ctx.storage.kv, settings, off, now).then(
+        (payload) => ({ payload }),
+        (error: unknown) => ({ error }),
+      ),
+    );
+    if ("error" in outcome) throw outcome.error;
+    if (outcome.payload) await notify(settings.webhook, outcome.payload);
   }
 
   snooze(code: string | null, minutes: number, now: number): SnoozeResult {
