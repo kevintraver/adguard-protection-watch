@@ -18,13 +18,7 @@ You need an AdGuard DNS API key and a Cloudflare API token from the "Edit Cloudf
    npm install
    ```
 
-2. Create the KV namespace. Copy the `id` it prints into `kv_namespaces` in `wrangler.jsonc`.
-
-   ```sh
-   fnox exec -- npx wrangler kv namespace create STATE
-   ```
-
-3. Set the secrets. Wrangler prompts for each value.
+2. Set the secrets. Wrangler prompts for each value.
 
    ```sh
    fnox exec -- npx wrangler secret put ADGUARD_DNS_API_KEY
@@ -42,13 +36,15 @@ You need an AdGuard DNS API key and a Cloudflare API token from the "Edit Cloudf
    | `PUBLIC_URL` | The Worker's own URL, such as `https://adguard-protection-watch.<subdomain>.workers.dev`. Reminders use it to build the snooze link. |
    | `WEBHOOK_AUTH` | Optional. Sent as the webhook's `Authorization` header, such as `Bearer <key>`. |
 
-4. Deploy.
+3. Deploy.
 
    ```sh
    fnox exec -- npx wrangler deploy
    ```
 
-5. Save the bot rules from [PLAN.md](PLAN.md#bot-rules) in the bot's own instructions. The webhook carries data only, so the bot needs those rules to act on a reply.
+   The state lives in a Durable Object, `WatchKeeper`, declared under `exports` in `wrangler.jsonc`. The first deploy creates it, so there's nothing to set up by hand. It uses SQLite storage, which the Workers Free plan supports.
+
+4. Save the bot rules from [PLAN.md](PLAN.md#bot-rules) in the bot's own instructions. The webhook carries data only, so the bot needs those rules to act on a reply.
 
 The timings live in `vars` in `wrangler.jsonc`. `REMIND_AFTER_MIN` defaults to 60, `AUTO_ENABLE_AFTER_MIN` to 5, and `DEFAULT_SNOOZE_MIN` to 60. A missing or invalid value falls back to its default.
 

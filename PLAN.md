@@ -13,7 +13,7 @@ AdGuard Protection Watch is a small Cloudflare Worker that notices. Once protect
 | Failure | What happens |
 |---|---|
 | A reminder webhook fails (bot down, URL changed) | It still counts as sent, and protection is turned on at the next check. |
-| KV read or write fails while protection is off | Protection is turned on. |
+| The Durable Object's storage fails, or the Durable Object can't be reached, while protection is off | Protection is turned on. |
 | Any unexpected error in the check while protection is off | Protection is turned on. |
 | A setting is missing or invalid (`REMIND_AFTER_MIN`, etc.) | The default is used (60 / 5 / 60). |
 | A snooze request is invalid (bad code, bad minutes) | It's rejected. The reminder still stands, so protection is turned on on schedule. |
@@ -43,25 +43,27 @@ The timing doesn't need to be exact. A 5-minute check means the reminder comes 6
             every 5 min
 Cloudflare cron ───────▶ Worker.scheduled()
                            │  GET v2/dns_servers + v2/devices  (AdGuard API)
-                           │  read/write KV "state"
+                           ▼
+                     WatchKeeper.check()  (Durable Object)
+                           │  read/write the stored Watch
                            │  PUT …/settings on each off switch  (auto turn-on)
                            ▼
                      POST WEBHOOK_URLS ──▶ chat bot ──▶ you
                                               │           │
                                               │◀──────────┘ "snooze" / "turn on"
-                     Worker.fetch() ◀─────────┤ snooze: POST snooze URL
+     WatchKeeper.snooze() ◀─ Worker.fetch() ◀─┤ snooze: POST snooze URL
                      AdGuard API    ◀─────────┘ turn on: bot's own AdGuard access
 ```
 
 - **Runtime:** a Cloudflare Worker on the free plan, written in TypeScript.
-- **State:** one Workers KV key, `state`.
+- **State:** one SQLite-backed Durable Object, `WatchKeeper`, with a single instance named `watch`. It owns the stored `Watch`, so every read sees the last write.
 - **AdGuard API:** `https://api.adguard-dns.io/oapi`, with the header `Authorization: ApiKey <key>`.
   - Reading, two calls per check:
     - `GET /oapi/v2/dns_servers`: the server with `ADGUARD_SERVER_ID`, `settings.protection_enabled`.
     - `GET /oapi/v2/devices`: every device with `name` and `settings.protection_enabled` inline, keeping only those on that server.
   - Writing: `PUT /oapi/v1/dns_servers/{id}/settings` or `PUT /oapi/v1/devices/{id}/settings` with `{"protection_enabled": true}`.
 
-## State (KV key `state`)
+## State (Durable Object `WatchKeeper`)
 
 A state machine, so impossible combinations (reminded *and* snoozed) can't be stored:
 
@@ -72,11 +74,15 @@ type Watch =
   | { phase: "snoozed";  offSince: number; snoozeUntil: number };
 ```
 
-If the key is missing, protection was on at the last check. Stored state that doesn't parse as a `Watch` counts as an error, so the fail-safe turns protection on.
+The Durable Object stores the `Watch` under the key `watch`. If the key is missing, protection was on at the last check. Stored state that doesn't parse as a `Watch` counts as an error, so the fail-safe turns protection on.
 
-The decisions live in two pure functions in `src/domain.ts`. `decide(watch, off, now, config, newCode)` returns the next `Watch` and at most one effect (`remind` or `turnOn`). `applySnooze(watch, code, minutes, now)` handles the snooze endpoint. Everything with side effects (AdGuard, KV, webhooks) is in `src/index.ts` and the modules it calls.
+The decisions live in two pure functions in `src/domain.ts`. `decide(watch, off, now, config, newCode)` returns the next `Watch` and at most one effect (`remind` or `turnOn`). `applySnooze(watch, code, minutes, now)` handles the snooze endpoint. Everything with side effects (AdGuard, storage, webhooks) is in `src/index.ts`, `src/watch-keeper.ts` and the modules they call.
 
-The free plan allows **1,000 KV writes a day**, and the cron runs 288 times a day. The Worker therefore writes to KV only when the state changes. A normal day takes a handful of writes.
+The Worker reads AdGuard, then calls the Durable Object, which runs `decide`, any auto turn-on PUTs and the webhooks. A snooze also runs inside the Durable Object. While a check reads the state, runs any PUTs and writes the result, it holds incoming snoozes back (`blockConcurrencyWhile`). A snooze that arrives during an auto turn-on therefore waits and gets `410`. One that arrives before the check reads the state wins, and nothing is turned on. Webhooks go out after that, so a slow bot never holds snoozes back.
+
+The Workers Free plan allows 100,000 Durable Object requests, 100,000 rows written and 5 million rows read a day ([pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/)). The cron makes 288 requests a day, so the Durable Object simply writes the state on every check.
+
+The first version kept the state in a Workers KV key. KV is eventually consistent, and that lost snoozes (see Verified).
 
 ## Check logic (`scheduled`)
 
@@ -86,8 +92,9 @@ switches = [server] + devices on that server      # each: { kind, id, name, enab
   on error: log, return (try again next check; the Worker can't do anything without the API)
 off = switches where !enabled
 
-# From here on, any error → turnOn(off) (fail-safe).
+# From here on, any error → turnOn(off) (fail-safe), including the Durable Object being unreachable.
 try:
+  # in the Durable Object; snoozes wait from here until the state is saved
   { next, effect } = decide(stored watch, off, now, timings, crypto.randomUUID())
     # off empty            → next = null (clear)
     # no watch             → next = off(now)
@@ -97,8 +104,8 @@ try:
   if effect is turnOn:
     if every PUT succeeded: save next      # a failed PUT keeps the overdue reminder, so the next check retries it
     return
-  save next                                # KV is written only when the value changed
-  if effect is remind: POST webhooks { event: "reminder", ... }   # failures logged, never thrown
+  save next
+  if effect is remind: POST webhooks { event: "reminder", ... }   # after the save; failures logged, never thrown
 catch:
   log, turnOn(off)
 
@@ -107,7 +114,7 @@ turnOn(off):
   POST webhooks { event: "auto_enabled", off: the ones that turned on }   # best effort
 ```
 
-The error path's `auto_enabled` message says "The protection check hit an error, so AdGuard DNS protection is back on for …". A rare duplicate is accepted: if the KV delete fails after every PUT succeeded, the fail-safe repeats the (harmless) PUTs and sends a second `auto_enabled` message.
+The error path's `auto_enabled` message says "The protection check hit an error, so AdGuard DNS protection is back on for …". That message has no `off_since`, because the Worker's fail-safe doesn't read the stored state. A rare duplicate is accepted: if the storage delete fails after every PUT succeeded, the fail-safe repeats the (harmless) PUTs and sends a second `auto_enabled` message.
 
 ## HTTP endpoints (`fetch`)
 
@@ -120,8 +127,6 @@ The Worker accepts only one action, snooze. Turning protection on goes through t
 | `GET` | `/` | Returns `200 ok` (health check). Shows no state. |
 
 If the code is wrong or missing, the Worker returns `404`. If no reminder is pending, it returns `410 Gone`. Either way nothing changes, so auto turn-on still happens on schedule.
-
-KV takes up to about 60 seconds to sync between regions, so "one-time" is best-effort. That does no harm here.
 
 ## Webhook payload
 
@@ -173,7 +178,7 @@ If the bot can only forward messages, it still works: tap the snooze link and pr
 | `REMIND_AFTER_MIN` | var | yes | `60` |
 | `AUTO_ENABLE_AFTER_MIN` | var | yes | `5` |
 | `DEFAULT_SNOOZE_MIN` | var | yes | `60` |
-| `STATE` | KV binding | yes (namespace id) | — |
+| `WATCH` | Durable Object binding (`WatchKeeper`, SQLite storage) | yes | — |
 | cron | trigger | yes | `*/5 * * * *` |
 | `ADGUARD_DNS_API_KEY` | secret | **no** | AdGuard DNS API key |
 | `ADGUARD_SERVER_ID` | secret | **no** | ID of the DNS server to watch (from `GET /oapi/v1/dns_servers`) |
@@ -189,14 +194,14 @@ If the bot can only forward messages, it still works: tap the snooze link and pr
 
 ```
 adguard-protection-watch/
-  src/index.ts          # scheduled() + fetch()
+  src/index.ts          # scheduled() + fetch(), the fail-safe
   src/adguard.ts        # get/set protection
-  src/state.ts          # KV read/write
+  src/watch-keeper.ts   # Durable Object that owns the Watch: check(), snooze(), watch()
   src/domain.ts         # Watch state machine: decide(), applySnooze() (pure)
   src/config.ts         # env → typed settings, with defaults
   src/webhook.ts        # payloads + delivery
   test/domain.test.ts   # pure reducer tests
-  test/worker.test.ts   # real scheduled/fetch handlers, miniflare KV, stubbed AdGuard + webhook
+  test/worker.test.ts   # real scheduled/fetch handlers, miniflare Durable Object, stubbed AdGuard + webhook
                         # vitest 4 + @cloudflare/vitest-plugin (the renamed vitest-pool-workers)
   wrangler.jsonc
   .dev.vars.example
@@ -208,7 +213,7 @@ adguard-protection-watch/
 Unit tests use a mocked AdGuard API, a mocked webhook, and a fake clock.
 
 **Normal flow:**
-- Protection on with no state: no writes.
+- Protection on with no state: nothing stored, nothing sent.
 - Protection on with state: state deleted.
 - Off for the first time: `off_since` written.
 - Off for less than 60 minutes: nothing happens.
@@ -227,13 +232,19 @@ Unit tests use a mocked AdGuard API, a mocked webhook, and a fake clock.
 
 **Fail-safe:**
 - Webhook fails: still counts as a reminder sent, and protection is turned on at the next check.
-- KV read throws while protection is off: protection turned on.
-- KV write throws while protection is off: protection turned on.
-- Unexpected exception while protection is off: protection turned on.
+- Storage read throws while protection is off: protection turned on.
+- Storage write throws while protection is off: protection turned on.
+- The Durable Object can't be reached while protection is off: protection turned on.
+- Corrupt stored state, including a snooze with no valid end: protection turned on.
 - Missing or invalid setting values: defaults used.
 - Wrong code returns 404 and no pending reminder returns 410. In both cases state is unchanged and auto turn-on still happens.
 - A GET never changes state.
 - AdGuard API error: no state change, nothing thrown.
+
+**Concurrency:**
+- A snooze sent while the reminder webhook is still being delivered succeeds.
+- A snooze that lands while a due check reads AdGuard wins: snoozed, nothing turned on.
+- A snooze that lands during the auto turn-on PUT loses: protection turned on, the snooze gets `410`.
 
 ## End-to-end check against a real server
 
@@ -268,17 +279,20 @@ These were tested against a real AdGuard DNS account (one server, three devices)
 - Device off again. The reminder came at 10:55. With no reply, the 11:00 check turned the device on, sent `auto_enabled`, and cleared the state. The canary lookup confirmed filtering was live again.
 - The first cron run came about 12 minutes after the first deploy (10:25 for a 10:13 deploy). That's normal for a newly created Cron Trigger.
 
-**Known issue: KV consistency.** KV takes up to 60 seconds to sync between locations. A snooze sent within about a minute of a reminder can reach a location that hasn't seen the reminder yet. It then gets a 410 and the snooze is lost (fail-safe: protection turns on as if there were no reply). Seen live: a probe 30 seconds after a reminder got 410, while the bot's snooze 43 seconds after got through. Fixing it means moving state to storage with strong consistency.
+**Resolved: KV consistency.** KV takes up to 60 seconds to sync between locations. A snooze sent within about a minute of a reminder could reach a location that hadn't seen the reminder yet. It then got a 410 and the snooze was lost (fail-safe: protection turned on as if there were no reply). Seen live: a probe 30 seconds after a reminder got 410, while the bot's snooze 43 seconds after got through. The state now lives in a Durable Object, which has a single owner and strong consistency.
+
+**Durable Object end-to-end run (2026-11-04, 5-minute test timers):** the device was turned off at 11:28. The 11:30 check recorded it and the 11:35 check sent a reminder. The bot's snooze landed **31 seconds** after the reminder and got HTTP 200. That's the window where KV used to lose snoozes. The 11:40 check stayed quiet (snoozed until 11:40:54), and 11:45 sent a new reminder. With no reply, the 11:50 check turned the device on and sent `auto_enabled`. The canary confirmed filtering was live.
 
 ## Build steps
 
 1. ~~Check what the bot's webhook expects, and confirm the server and device toggles in the API.~~ Done (see Verified).
 2. ~~Create the GitHub repo.~~ Done.
 3. ~~Scaffold the Worker.~~ Done.
-4. ~~Write the domain, then the shell, with tests.~~ Done: 60 tests, plus a mutation check where 10 deliberate breakages each turn at least one test red.
-5. Create the KV namespace, put in the secrets, and deploy.
+4. ~~Write the domain, then the shell, with tests.~~ Done: 65 tests, plus a mutation check where 15 deliberate breakages each turn at least one test red.
+5. Put in the secrets and deploy.
 6. Run the end-to-end check above.
 7. Add the bot rules to the bot.
+8. Deploy the Durable Object version while protection is on (the Durable Object starts empty, so a timer running in KV would restart). Rerun the snooze step of the end-to-end check with a snooze sent within a minute of the reminder. Then delete the old KV namespace.
 
 ## Out of scope
 

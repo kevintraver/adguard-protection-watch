@@ -1,19 +1,27 @@
-import { applySnooze, decide, type Switch } from "./domain";
+import { applySnooze, type Switch } from "./domain";
 import { parseMinutes, parseSettings, type Settings } from "./config";
-import { enableProtection, readSwitches } from "./adguard";
-import { readWatch, saveWatch } from "./state";
-import { autoEnabledPayload, notify, reminderPayload } from "./webhook";
+import { enableAll, readSwitches } from "./adguard";
+import { autoEnabledPayload, notify } from "./webhook";
+import type { WatchKeeper } from "./watch-keeper";
+
+export { WatchKeeper } from "./watch-keeper";
+
+type Keeper = DurableObjectStub<WatchKeeper>;
 
 export default {
   async scheduled(controller, env) {
-    await check(parseSettings(env), env.STATE, controller.scheduledTime);
+    await check(parseSettings(env), keeper(env), controller.scheduledTime);
   },
   async fetch(request: Request, env: Env) {
-    return route(request, parseSettings(env), env.STATE, Date.now());
+    return route(request, parseSettings(env), keeper(env), Date.now());
   },
 } satisfies ExportedHandler<Env>;
 
-async function check(settings: Settings, kv: KVNamespace, now: number): Promise<void> {
+function keeper(env: Env): Keeper {
+  return env.WATCH.getByName("watch");
+}
+
+async function check(settings: Settings, keeper: Keeper, now: number): Promise<void> {
   let off: Switch[];
   try {
     off = (await readSwitches(settings.adguard)).filter((s) => !s.enabled);
@@ -22,53 +30,26 @@ async function check(settings: Settings, kv: KVNamespace, now: number): Promise<
     return;
   }
 
-  let offSince: number | null = null;
   try {
-    const stored = await readWatch(kv);
-    offSince = stored.watch?.offSince ?? null;
-    const { next, effect } = decide(stored.watch, off, now, settings.timing, crypto.randomUUID());
-    if (effect?.type === "turnOn") {
-      // A switch that failed to turn on keeps the overdue reminder, so the next check retries it.
-      if (await turnOn(settings, effect.off, effect.offSince, "no_reply")) await saveWatch(kv, stored, next);
-      return;
-    }
-    await saveWatch(kv, stored, next);
-    if (effect?.type === "remind") await notify(settings.webhook, reminderPayload(effect, now, settings));
+    await keeper.check(settings, off, now);
   } catch (err) {
     console.error("Protection check failed; turning on every switch that is off", err);
-    await turnOn(settings, off, offSince, "error");
+    const turnedOn = await enableAll(settings.adguard, off);
+    if (turnedOn.length > 0) await notify(settings.webhook, autoEnabledPayload(turnedOn, null, "error"));
   }
 }
 
-async function turnOn(
-  settings: Settings,
-  off: Switch[],
-  offSince: number | null,
-  reason: "no_reply" | "error",
-): Promise<boolean> {
-  if (off.length === 0) return true;
-  const results = await Promise.allSettled(off.map((s) => enableProtection(settings.adguard, s)));
-  const turnedOn = off.filter((s, i) => {
-    const result = results[i];
-    if (result?.status === "rejected") console.error(`Could not turn on protection for ${s.kind} ${s.id}`, result.reason);
-    return result?.status === "fulfilled";
-  });
-  if (turnedOn.length > 0) await notify(settings.webhook, autoEnabledPayload(turnedOn, offSince, reason));
-  return turnedOn.length === off.length;
-}
-
-async function route(request: Request, settings: Settings, kv: KVNamespace, now: number): Promise<Response> {
+async function route(request: Request, settings: Settings, keeper: Keeper, now: number): Promise<Response> {
   const url = new URL(request.url);
   if (url.pathname === "/" && request.method === "GET") return new Response("ok");
   if (url.pathname !== "/snooze") return new Response("Not found", { status: 404 });
-  if (request.method === "GET") return snoozePage(url, settings, kv, now);
-  if (request.method === "POST") return snooze(request, url, settings, kv, now);
+  if (request.method === "GET") return snoozePage(url, settings, keeper, now);
+  if (request.method === "POST") return snooze(request, url, settings, keeper, now);
   return new Response("Not found", { status: 404 });
 }
 
-async function snoozePage(url: URL, settings: Settings, kv: KVNamespace, now: number): Promise<Response> {
-  const { watch } = await readWatch(kv);
-  const result = applySnooze(watch, url.searchParams.get("code"), settings.timing.defaultSnoozeMin, now);
+async function snoozePage(url: URL, settings: Settings, keeper: Keeper, now: number): Promise<Response> {
+  const result = applySnooze(await keeper.watch(), url.searchParams.get("code"), settings.timing.defaultSnoozeMin, now);
   if (result.type !== "ok") return rejection(result.type);
   return html(
     `<h1>Snooze the AdGuard reminder</h1>
@@ -79,16 +60,14 @@ async function snoozePage(url: URL, settings: Settings, kv: KVNamespace, now: nu
   );
 }
 
-async function snooze(request: Request, url: URL, settings: Settings, kv: KVNamespace, now: number): Promise<Response> {
+async function snooze(request: Request, url: URL, settings: Settings, keeper: Keeper, now: number): Promise<Response> {
   const fromForm = request.headers.get("content-type")?.startsWith("application/x-www-form-urlencoded") ?? false;
   const rawMinutes = fromForm ? (await request.formData()).get("minutes") : url.searchParams.get("minutes");
   const minutes = rawMinutes === null ? settings.timing.defaultSnoozeMin : parseMinutes(rawMinutes);
   if (minutes === null) return new Response("minutes must be a whole number of at least 1", { status: 400 });
 
-  const stored = await readWatch(kv);
-  const result = applySnooze(stored.watch, url.searchParams.get("code"), minutes, now);
+  const result = await keeper.snooze(url.searchParams.get("code"), minutes, now);
   if (result.type !== "ok") return rejection(result.type);
-  await saveWatch(kv, stored, result.next);
 
   if (fromForm) return html(`<h1>Snoozed for ${minutes} min</h1><p>If protection is still off after that, you'll get a new reminder.</p>`);
   return Response.json({ ok: true, snooze_until: new Date(result.next.snoozeUntil).toISOString() });
