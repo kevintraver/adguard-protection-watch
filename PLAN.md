@@ -159,7 +159,7 @@ Save these in the bot's own instructions (not in the webhook):
 
 > For webhooks from `adguard-protection-watch`:
 > - `event: "reminder"`: send me the `message`.
-> - If I then reply "snooze" or "snooze <duration>": convert the duration to whole minutes (default 60) and send an HTTP **POST** to the `snooze.url` from the most recent reminder, with `&minutes=<N>` added to the end.
+> - If I then reply "snooze" or "snooze <duration>": convert the duration to whole minutes (default 60) and send an HTTP **POST** to the `snooze.url` from the most recent reminder, with `&minutes=<N>` added to the end. Then tell me when the next reminder will come (now + the snooze minutes). Don't say protection turns back on at that time: when the snooze ends I get a new reminder, and protection only turns on by itself if I don't answer that one.
 > - If I reply "turn on": for every item in the most recent reminder's `off` list, set `protection_enabled=true` using your AdGuard DNS API access. `kind: "server"` → `PUT /dns_servers/{id}/settings`. `kind: "device"` → `PUT /devices/{id}/settings`. Then tell me which ones you turned on.
 > - If my reply is unclear, do nothing (protection turns back on by itself).
 > - `event: "auto_enabled"`: send me the `message`. No action needed.
@@ -260,6 +260,15 @@ These were tested against a real AdGuard DNS account (one server, three devices)
 - It ignores instructions sent inside a webhook, so the handling rules belong in the bot's own saved settings (see Bot rules).
 - When the user replied "snooze for 20 minutes", the bot sent `POST <snooze.url>&minutes=20` to the link from the earlier reminder. So it keeps the reminder's context when a reply comes in.
 - When the user replied "turn on" to a reminder listing one device, the bot set that device's `protection_enabled=true`, said which device it turned on, and didn't call the snooze link.
+
+**Deployed end-to-end run (2026-11-04, 5-minute test timers, one device):**
+- Device turned off at 10:24. The 10:25 check recorded it, and the 10:30 check sent a reminder that reached the bot.
+- The bot's snooze (`minutes=5`) got HTTP 200. The 10:35 check stayed quiet, and the 10:40 check sent a new reminder ("off for 15 min").
+- "turn on" through the bot turned the device on, and the 10:45 check cleared the state with no extra message.
+- Device off again. The reminder came at 10:55. With no reply, the 11:00 check turned the device on, sent `auto_enabled`, and cleared the state. The canary lookup confirmed filtering was live again.
+- The first cron run came about 12 minutes after the first deploy (10:25 for a 10:13 deploy). That's normal for a newly created Cron Trigger.
+
+**Known issue: KV consistency.** KV takes up to 60 seconds to sync between locations. A snooze sent within about a minute of a reminder can reach a location that hasn't seen the reminder yet. It then gets a 410 and the snooze is lost (fail-safe: protection turns on as if there were no reply). Seen live: a probe 30 seconds after a reminder got 410, while the bot's snooze 43 seconds after got through. Fixing it means moving state to storage with strong consistency.
 
 ## Build steps
 
