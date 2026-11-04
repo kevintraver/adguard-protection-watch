@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "adguard-protection-watch",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-03",
+  "observability": { "enabled": true },
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "kv_namespaces": [
+    // Replace with the id printed by `wrangler kv namespace create STATE`.
+    { "binding": "STATE", "id": "00000000000000000000000000000000" }
+  ],
+  "vars": {
+    "REMIND_AFTER_MIN": "60",
+    "AUTO_ENABLE_AFTER_MIN": "5",
+    "DEFAULT_SNOOZE_MIN": "60"
+  },
+  "secrets": {
+    "required": ["ADGUARD_DNS_API_KEY", "ADGUARD_SERVER_ID", "WEBHOOK_URLS", "PUBLIC_URL"]
+  }
+}
