@@ -2,7 +2,9 @@
 
 ## Goal
 
-Kevin turns off AdGuard DNS protection and forgets to turn it back on. After protection has been off for an hour, a Cloudflare Worker sends a reminder through the Grok bot. If Kevin doesn't answer, the Worker turns protection back on itself.
+You turn off AdGuard DNS protection to get past something it's blocking, then forget to turn it back on. AdGuard DNS has no "turn off for an hour" option.
+
+AdGuard Protection Watch is a small Cloudflare Worker that notices. Once protection has been off for an hour, it sends a reminder to a chat bot (or any webhook). You can snooze it or turn protection back on. If you don't answer, the Worker turns protection back on by itself.
 
 ## Fail-safe rule
 
@@ -20,21 +22,20 @@ Kevin turns off AdGuard DNS protection and forgets to turn it back on. After pro
 
 ## How it behaves
 
-1. Kevin turns protection off with one of the **switches the Worker watches**:
-   - **A device toggle** (the usual case, e.g. just "Kevin's MacBook Pro"): `GET/PUT /devices/{id}/settings` → `protection_enabled`.
-   - **The server toggle**: the "Protection is enabled/disabled" switch under "Kevin's AdGuard Server". It covers all devices: `GET/PUT /dns_servers/{id}/settings` → `protection_enabled`.
-   - **Not the account-wide toggle at the top of Home.** The public API can't see or change that one, so the Worker would never notice it.
-2. A Worker cron checks every 5 minutes. It reads the server and every device; devices are listed fresh each time, so new devices are covered automatically. **One shared timer:** the switch counts as "off" if any switch is off. The first check that finds anything off records `off_since`. The timer keeps running until *every* switch is back on, even if the off switches change in between.
-3. Once something has been off for `REMIND_AFTER_MIN` (60), the Worker sends a **reminder** webhook to the Grok bot listing what's off (e.g. "Kevin's MacBook Pro"). Kevin can reply:
-   - **"turn on"**: the bot turns on every switch in the reminder's `off` list directly through the AdGuard API (its existing `adguard-dns` access). The Worker sees everything on at the next check and clears its state.
-   - **"snooze"**: no reminders for 1 hour. "snooze 20m" or "snooze 3h" picks the length. There's no limit on how long a snooze lasts or how many times in a row Kevin snoozes. When the snooze ends, the next check sends a new reminder.
-   - **"snooze"** covers everything that's off, including a switch turned off during the snooze.
+1. You turn protection off with one of the **switches the Worker watches**:
+   - **A device toggle** (the usual case, e.g. just your laptop): `GET/PUT /devices/{id}/settings` → `protection_enabled`.
+   - **The server toggle**: the "Protection is enabled/disabled" switch under your DNS server on the dashboard Home page. It covers every device on that server: `GET/PUT /dns_servers/{id}/settings` → `protection_enabled`.
+   - **Not the account-wide toggle at the top of Home.** The public API can't see or change that one, so the Worker would never notice it. Use a device or server toggle instead.
+2. A Worker cron checks every 5 minutes. It reads the server and every device on it. Devices are listed fresh each time, so new devices are covered automatically. **One shared timer:** protection counts as "off" if any switch is off. The first check that finds anything off records `off_since`. The timer keeps running until *every* switch is back on, even if the set of off switches changes in between.
+3. Once something has been off for `REMIND_AFTER_MIN` (60), the Worker sends a **reminder** webhook listing what's off (e.g. "MacBook Pro"). You can reply to the bot:
+   - **"turn on"**: the bot turns on every switch in the reminder's `off` list, using its own AdGuard API access. The Worker sees everything on at the next check and clears its state.
+   - **"snooze"**: no reminders for 1 hour. "snooze 20m" or "snooze 3h" picks the length. There's no limit on how long a snooze lasts or how many times in a row you snooze. A snooze covers everything that's off, including a switch turned off during the snooze. When the snooze ends, the next check sends a new reminder.
 4. If there's no reply within `AUTO_ENABLE_AFTER_MIN` (5) of a reminder, the Worker turns on **every switch that's off at that moment** and sends an **auto_enabled** webhook listing them.
-5. When a check finds every switch on, whether Kevin turned them on, the bot did, the Worker did, or anyone else did, the stored state is cleared. The next time anything goes off, the cycle starts fresh.
+5. When a check finds every switch on, whether you turned them on, the bot did, the Worker did, or anyone else did, the stored state is cleared. The next time anything goes off, the cycle starts fresh.
 
 The timing doesn't need to be exact. A 5-minute check means the reminder comes 60 to 65 minutes after protection goes off, and auto turn-on comes about one check after the reminder.
 
-**One shared timer, by design.** Kevin rarely has more than one thing off at once, and one timer is simpler than a timer per switch. The catch: a second device turned off 50 minutes after the first gets only about 10 minutes before the shared reminder. That's acceptable.
+**One shared timer, by design.** It's rare to have more than one thing off at once, and one timer is simpler than a timer per switch. The catch: a second device turned off 50 minutes after the first gets only about 10 minutes before the shared reminder. That's acceptable.
 
 ## Architecture
 
@@ -45,16 +46,16 @@ Cloudflare cron ───────▶ Worker.scheduled()
                            │  read/write KV "state"
                            │  PUT …/settings on each off switch  (auto turn-on)
                            ▼
-                     POST WEBHOOK_URLS ──▶ Grok bot ──▶ Kevin
+                     POST WEBHOOK_URLS ──▶ chat bot ──▶ you
                                               │           │
                                               │◀──────────┘ "snooze" / "turn on"
                      Worker.fetch() ◀─────────┤ snooze: POST snooze URL
-                     AdGuard API    ◀─────────┘ turn on: adguard-dns skill
+                     AdGuard API    ◀─────────┘ turn on: bot's own AdGuard access
 ```
 
 - **Runtime:** a Cloudflare Worker on the free plan, written in TypeScript.
 - **State:** one Workers KV key, `state`.
-- **AdGuard API:** `https://api.adguard-dns.io/oapi/v1`, with the header `Authorization: ApiKey <key>`.
+- **AdGuard API:** `https://api.adguard-dns.io/oapi`, with the header `Authorization: ApiKey <key>`.
   - Reading, two calls per check:
     - `GET /oapi/v2/dns_servers`: the server with `ADGUARD_SERVER_ID`, `settings.protection_enabled`.
     - `GET /oapi/v2/devices`: every device with `name` and `settings.protection_enabled` inline, keeping only those on that server.
@@ -130,16 +131,16 @@ KV takes up to about 60 seconds to sync between regions, so "one-time" is best-e
 
 ## Webhook payload
 
-The Worker sends a `POST` to each URL in `WEBHOOK_URLS` (comma-separated) with `Content-Type: application/json`:
+The Worker sends a `POST` to each URL in `WEBHOOK_URLS` (comma-separated) with `Content-Type: application/json`. If `WEBHOOK_AUTH` is set, it's sent as the `Authorization` header (e.g. `Bearer <key>`).
 
 ```json
 {
   "event": "reminder",
-  "message": "AdGuard DNS protection is off for Kevin's MacBook Pro (1h). Reply \"snooze\" (or \"snooze 20m\") or \"turn on\". It turns back on automatically in ~5 min.",
+  "message": "AdGuard DNS protection is off for MacBook Pro (1h). Reply \"snooze\" (or \"snooze 20m\") or \"turn on\". It turns back on automatically in ~5 min.",
   "off_since": "2026-11-04T19:02:00Z",
   "auto_enable_at": "2026-11-04T20:07:00Z",
   "off": [
-    { "kind": "device", "id": "<device-id>", "name": "Kevin's MacBook Pro" }
+    { "kind": "device", "id": "<device-id>", "name": "MacBook Pro" }
   ],
   "snooze": { "method": "POST", "url": "https://<worker>/snooze?code=…", "params": { "minutes": "integer, default 60" } }
 }
@@ -148,21 +149,28 @@ The Worker sends a `POST` to each URL in `WEBHOOK_URLS` (comma-separated) with `
 ```json
 {
   "event": "auto_enabled",
-  "message": "No reply, so AdGuard DNS protection is back on for Kevin's MacBook Pro.",
+  "message": "No reply, so AdGuard DNS protection is back on for MacBook Pro.",
   "off_since": "2026-11-04T19:02:00Z",
   "off": [
-    { "kind": "device", "id": "<device-id>", "name": "Kevin's MacBook Pro" }
+    { "kind": "device", "id": "<device-id>", "name": "MacBook Pro" }
   ]
 }
 ```
 
-Messages give relative times ("~5 min") so the Worker needs no time zone setting.
+Messages give relative times ("~5 min") so the Worker needs no time zone setting. The payload carries data only, never instructions: a well-behaved bot won't follow instructions that arrive in a webhook.
 
-**Grok bot:** the bot needs instructions for these webhooks.
-- It forwards `message` to Kevin.
-- When Kevin replies "turn on", it uses its `adguard-dns` access to set `protection_enabled=true` on every item in the reminder's `off` list (`kind: "server"` → `/dns_servers/{id}/settings`, `kind: "device"` → `/devices/{id}/settings`).
-- When Kevin replies "snooze [duration]", it converts the duration to minutes and POSTs `snooze.url&minutes=N`.
-- If it can't tell what Kevin meant, it does nothing and auto turn-on proceeds.
+### Bot rules
+
+Save these in the bot's own instructions (not in the webhook):
+
+> For webhooks from `adguard-protection-watch`:
+> - `event: "reminder"`: send me the `message`.
+> - If I then reply "snooze" or "snooze <duration>": convert the duration to whole minutes (default 60) and send an HTTP **POST** to the `snooze.url` from the most recent reminder, with `&minutes=<N>` added to the end.
+> - If I reply "turn on": for every item in the most recent reminder's `off` list, set `protection_enabled=true` using your AdGuard DNS API access. `kind: "server"` → `PUT /dns_servers/{id}/settings`. `kind: "device"` → `PUT /devices/{id}/settings`. Then tell me which ones you turned on.
+> - If my reply is unclear, do nothing (protection turns back on by itself).
+> - `event: "auto_enabled"`: send me the `message`. No action needed.
+
+If the bot can only forward messages, it still works: tap the snooze link and press the button on the page, or flip the toggle yourself. Doing nothing is safe, because protection comes back on by itself.
 
 ## Configuration
 
@@ -173,15 +181,16 @@ Messages give relative times ("~5 min") so the Worker needs no time zone setting
 | `DEFAULT_SNOOZE_MIN` | var | yes | `60` |
 | `STATE` | KV binding | yes (namespace id) | — |
 | cron | trigger | yes | `*/5 * * * *` |
-| `ADGUARD_DNS_API_KEY` | secret | **no** | AdGuard API key |
-| `ADGUARD_SERVER_ID` | secret | **no** | ID of "Kevin's AdGuard Server" |
-| `WEBHOOK_URLS` | secret | **no** | Grok bot webhook URL (anyone holding it can message the bot) |
+| `ADGUARD_DNS_API_KEY` | secret | **no** | AdGuard DNS API key |
+| `ADGUARD_SERVER_ID` | secret | **no** | ID of the DNS server to watch (from `GET /oapi/v1/dns_servers`) |
+| `WEBHOOK_URLS` | secret | **no** | Webhook URL(s), comma-separated. Anyone holding one can message the bot. |
+| `WEBHOOK_AUTH` | secret | **no** | Optional `Authorization` header value for the webhook, e.g. `Bearer <key>` |
 
-## Repo
+## Repo and deploy
 
-- `kevintraver/adguard-protection-watch`, **public**, in this folder.
 - No secrets in git. Secrets are set with `wrangler secret put`, and local dev reads `.dev.vars`, which is gitignored.
-- Deploy by running `wrangler deploy` from the Mac. No CI.
+- Deploy with `wrangler deploy`. No CI.
+- Cloudflare access: an API token from the "Edit Cloudflare Workers" template, plus the account ID.
 
 ```
 adguard-protection-watch/
@@ -226,10 +235,10 @@ Unit tests use a mocked AdGuard API, a mocked webhook, and a fake clock.
 - A GET never changes state.
 - AdGuard API error: no state change, nothing thrown.
 
-## End-to-end check against the real server
+## End-to-end check against a real server
 
 1. Deploy with `REMIND_AFTER_MIN=5` and `AUTO_ENABLE_AFTER_MIN=5`.
-2. Turn protection off for **one device** in the dashboard. A reminder naming that device should arrive in the Grok bot within about 10 minutes.
+2. Turn protection off for **one device** in the dashboard. A reminder naming that device should arrive in the bot within about 10 minutes.
 3. Reply "snooze 5m". The next reminder should arrive about 5 minutes after the snooze ends.
 4. Ignore it. Protection should come back on within about 5 minutes, with an `auto_enabled` message.
 5. Turn protection off again, wait for the reminder, and reply "turn on". The bot should turn protection on, and the next check should clear the state.
@@ -238,36 +247,37 @@ Unit tests use a mocked AdGuard API, a mocked webhook, and a fake clock.
 
 ## Verified (2026-11-04)
 
-**The AdGuard API and the two toggles:**
-- The public API's `protection_enabled` (`PUT /dns_servers/{id}/settings`) is the **server** toggle. Setting it to `false` stopped filtering after about 10 seconds, setting it to `true` brought filtering back, and the dashboard's server toggle showed each change.
-- The **account-wide** "Protection is enabled" toggle at the top of Home also stops filtering, but it changes nothing the public API returns. The server and device `protection_enabled` both stayed `true`. No endpoint in the OpenAPI spec reads or changes it.
-- A reliable way to check whether filtering is live: look up a made-up `<random>.site` name. User rule `||*.site^` blocks it, so `0.0.0.0` means on and "doesn't exist" means off.
+These were tested against a real AdGuard DNS account (one server, three devices) before building.
 
-**The Grok bot (a Cursor Automation webhook, `Authorization: Bearer <key>`):**
-- It accepts the webhook and messages Kevin.
-- It ignores instructions sent inside a webhook, so the handling rules live in the bot's own saved settings.
-- When Kevin replied "snooze for 20 minutes", the bot sent `POST <snooze.url>&minutes=20` to the link from the earlier reminder. So it keeps the reminder's context when a reply comes in.
-- When Kevin replied "turn on" to a reminder with `off: [{kind: "device", id: "<device-id>"}]`, the bot set that device's `protection_enabled=true`, told Kevin which device it turned on, and didn't call the snooze link.
+**The AdGuard API and the two kinds of toggle:**
+- The public API's server `protection_enabled` (`PUT /dns_servers/{id}/settings`) is the **server** toggle on the dashboard. Setting it to `false` stopped filtering after about 10 seconds, setting it to `true` brought filtering back, and the dashboard's server toggle showed each change.
+- A device's `protection_enabled` is that device's toggle. Turning one device off in the dashboard showed up as `false` in `GET /oapi/v2/devices`, with the server and other devices still `true`, and filtering stopped for that device only. Setting it back to `true` through the API restored filtering.
+- The **account-wide** "Protection is enabled" toggle at the top of Home also stops filtering, but it changes nothing the public API returns. Server and device `protection_enabled` both stayed `true`. No endpoint in the OpenAPI spec reads or changes it.
+- A reliable way to check whether filtering is really live: look up a made-up name under a domain one of your rules blocks (e.g. `<random>.example-blocked-tld`). A blocked answer (`0.0.0.0`) means on, and "doesn't exist" means off.
 
-**Device toggles:**
-- Turning off "Kevin's MacBook Pro" with its dashboard device toggle showed up as `protection_enabled: false` in `GET /oapi/v2/devices`, with the server and other devices still `true`. The canary lookup was not blocked.
-- After the bot turned it on, the API showed `true` again and the canary was blocked again.
+**The chat bot (tested with a Cursor Automation webhook, `Authorization: Bearer <key>`):**
+- It accepts the webhook and messages you.
+- It ignores instructions sent inside a webhook, so the handling rules belong in the bot's own saved settings (see Bot rules).
+- When the user replied "snooze for 20 minutes", the bot sent `POST <snooze.url>&minutes=20` to the link from the earlier reminder. So it keeps the reminder's context when a reply comes in.
+- When the user replied "turn on" to a reminder listing one device, the bot set that device's `protection_enabled=true`, said which device it turned on, and didn't call the snooze link.
 
 ## Build steps
 
-1. ~~Find out what the Grok bot's webhook expects, and confirm the device toggles.~~ Done (see Verified).
-2. Run `git init`, create the public GitHub repo, and scaffold the Worker with `npm create cloudflare`.
-3. Write `adguard.ts` and `state.ts`, then `scheduled()`, then `fetch()`, with tests for each.
-4. Create the KV namespace, put in the secrets, and deploy.
-5. Run the end-to-end check above.
-6. Add the webhook handling instructions to the Grok bot.
+1. ~~Check what the bot's webhook expects, and confirm the server and device toggles in the API.~~ Done (see Verified).
+2. ~~Create the GitHub repo.~~ Done.
+3. Scaffold the Worker with `npm create cloudflare`.
+4. Write `adguard.ts` and `state.ts`, then `scheduled()`, then `fetch()`, with tests for each.
+5. Create the KV namespace, put in the secrets, and deploy.
+6. Run the end-to-end check above.
+7. Add the bot rules to the bot.
 
 ## Out of scope
 
 - Pausing from chat, or timed pauses ("pause 20 min").
 - Separate timers, snoozes or replies per device (one shared timer instead).
-- The account-wide Home toggle. The public API can't see it, so Kevin uses the server toggle instead.
-- Pushover, ntfy, and email.
+- The account-wide Home toggle. The public API can't see it; use a server or device toggle instead.
+- Watching more than one DNS server.
+- Built-in notification services (Pushover, ntfy, email). The webhook can point at any of them.
 - Quiet hours.
 - AdGuard API outages: that's AdGuard's problem, not this tool's. The Worker only retries at the next check, and errors go to the Worker logs with no alert.
 - CI or automated deploys.
