@@ -13,6 +13,6 @@
     "DEFAULT_SNOOZE_MIN": "60"
   },
   "secrets": {
-    "required": ["ADGUARD_DNS_API_KEY", "ADGUARD_SERVER_ID", "WEBHOOK_URLS", "PUBLIC_URL"]
+    "required": ["ADGUARD_DNS_API_KEY", "ADGUARD_SERVER_ID", "PUBLIC_URL", "ADGUARD_WATCH_WEBHOOKS_TOKEN"]
   }
 }

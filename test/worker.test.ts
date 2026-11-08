@@ -24,7 +24,7 @@ class World {
   failingPuts = new Set<string>();
   webhookResponse: "ok" | "500" | "network error" = "ok";
   puts: string[] = [];
-  webhooks: { url: string; auth: string | null; payload: any }[] = [];
+  webhooks: { url: string; auth: string | null; contentType: string | null; payload: any }[] = [];
   onWebhook: ((payload: any) => Promise<void>) | null = null;
   slowMs: Partial<Record<string, number>> = {};
   started: string[] = [];
@@ -42,8 +42,9 @@ class World {
   async handle(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.origin === "https://bot.test" || url.origin === "https://bot2.test") {
-      const payload = await request.json();
-      this.webhooks.push({ url: url.href, auth: request.headers.get("authorization"), payload });
+      const contentType = request.headers.get("content-type");
+      const payload = contentType?.startsWith("application/json") ? await request.json() : await request.text();
+      this.webhooks.push({ url: url.href, auth: request.headers.get("authorization"), contentType, payload });
       await this.onWebhook?.(payload);
       if (this.webhookResponse === "network error") throw new TypeError("network connection lost");
       return new Response(null, { status: this.webhookResponse === "ok" ? 200 : 500 });
@@ -93,6 +94,8 @@ beforeEach(async () => {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.spyOn(console, "error").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
+  expect((await register({ name: "Bot", url: "https://bot.test/hook" })).status).toBe(201);
+  world.webhooks = [];
 });
 
 afterEach(() => {
@@ -107,12 +110,32 @@ function bindings(overrides: Record<string, unknown> = {}): Env {
 
 const keeper = () => env.WATCH.getByName("watch");
 
-function breakStorage(method: "get" | "put" | "delete") {
+function breakStorage(method: "get" | "put" | "delete", key: string | null = "watch") {
   return runInDurableObject(keeper(), (_, state) => {
-    vi.spyOn(state.storage.kv, method).mockImplementation(() => {
-      throw new Error(`storage ${method} failed`);
-    });
+    const kv = state.storage.kv;
+    const original = kv[method].bind(kv) as (...args: unknown[]) => unknown;
+    vi.spyOn(kv, method).mockImplementation(((...args: unknown[]) => {
+      if (key === null || args[0] === key) throw new Error(`storage ${method} failed`);
+      return original(...args);
+    }) as never);
   });
+}
+
+const ADMIN = { Authorization: "Bearer test-admin-token" };
+
+function register(body: unknown, headers: Record<string, string> = ADMIN) {
+  return worker.fetch(
+    new Request("https://watch.test/webhooks", {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+    bindings(),
+  );
+}
+
+function admin(method: string, path: string, headers: Record<string, string> = ADMIN, e: Env = bindings()) {
+  return worker.fetch(new Request(`https://watch.test${path}`, { method, headers }), e);
 }
 
 async function checkAt(minutes: number, e: Env = bindings()) {
@@ -177,6 +200,7 @@ describe("normal flow", () => {
     expect(world.webhooks[0]).toEqual({
       url: "https://bot.test/hook",
       auth: null,
+      contentType: "application/json",
       payload: {
         event: "reminder",
         message:
@@ -189,6 +213,7 @@ describe("normal flow", () => {
           url: `https://watch.test/snooze?code=${state?.snoozeCode}`,
           params: { minutes: "integer, default 60" },
         },
+        turn_on: { method: "POST", url: `https://watch.test/turn-on?code=${state?.snoozeCode}` },
       },
     });
   });
@@ -249,14 +274,15 @@ describe("normal flow", () => {
     expect(events()).toEqual(["reminder"]);
   });
 
-  it("sends WEBHOOK_AUTH as the Authorization header to every webhook URL", async () => {
-    const e = bindings({ WEBHOOK_URLS: "https://bot.test/hook, https://bot2.test/other", WEBHOOK_AUTH: "Bearer secret" });
+  it("sends each webhook only its own headers", async () => {
+    expect((await register({ name: "Other", url: "https://bot2.test/other", headers: { Authorization: "Bearer two" } })).status).toBe(201);
+    world.webhooks = [];
     world.setOff("d1");
-    await checkAt(0, e);
-    await checkAt(60, e);
+    await checkAt(0);
+    await checkAt(60);
     expect(world.webhooks.map(({ url, auth }) => ({ url, auth }))).toEqual([
-      { url: "https://bot.test/hook", auth: "Bearer secret" },
-      { url: "https://bot2.test/other", auth: "Bearer secret" },
+      { url: "https://bot.test/hook", auth: null },
+      { url: "https://bot2.test/other", auth: "Bearer two" },
     ]);
   });
 });
@@ -421,12 +447,43 @@ describe("fail-safe", () => {
     expect(world.isOn("d1")).toBe(true);
   });
 
-  it("turns protection on when the Durable Object can't be reached", async () => {
+  it("turns protection on when the Durable Object can't be reached, with no message since the webhook list lives there", async () => {
     world.setOff("d1");
-    const unreachable = { getByName: () => ({ check: () => Promise.reject(new Error("Durable Object overloaded")) }) };
+    const down = () => Promise.reject(new Error("Durable Object overloaded"));
+    const unreachable = { getByName: () => ({ check: down, webhooksOrNone: down }) };
     await checkAt(0, bindings({ WATCH: unreachable }));
     expect(world.puts).toEqual(["devices/d1"]);
-    expect(lastPayload()).toMatchObject({ event: "auto_enabled", off: [{ id: "d1" }] });
+    expect(world.webhooks).toEqual([]);
+  });
+
+  it("turns protection on when every storage read throws", async () => {
+    world.setOff("d1");
+    await breakStorage("get", null);
+    await checkAt(0);
+    expect(world.puts).toEqual(["devices/d1"]);
+    expect(world.isOn("d1")).toBe(true);
+  });
+
+  it("still reminds on schedule and turns protection on when the webhook list is corrupt", async () => {
+    await runInDurableObject(keeper(), (_, state) => state.storage.kv.put("webhooks", [{ url: "nope" }]));
+    world.setOff("d1");
+    await checkAt(0);
+    await checkAt(60);
+    expect(await stored()).toMatchObject({ phase: "reminded" });
+    expect(world.webhooks).toEqual([]);
+    await checkAt(65);
+    expect(world.puts).toEqual(["devices/d1"]);
+  });
+
+  it("turns protection on after the reminder even with no webhooks registered", async () => {
+    const [hook] = await (await admin("GET", "/webhooks")).json<{ id: string }[]>();
+    expect((await admin("DELETE", `/webhooks/${hook!.id}`)).status).toBe(204);
+    world.setOff("d1");
+    await checkAt(0);
+    await checkAt(60);
+    await checkAt(65);
+    expect(world.webhooks).toEqual([]);
+    expect(world.puts).toEqual(["devices/d1"]);
   });
 
   it.each([
@@ -554,11 +611,220 @@ describe("other routes", () => {
     expect(await res.text()).toBe("ok");
   });
 
+  it("never turns protection on from a GET, so a link preview can't act", async () => {
+    const reminder = await remindedFromMinute0();
+    expect((await request(62, "GET", reminder.turn_on.url)).status).toBe(404);
+    expect(world.puts).toEqual([]);
+    expect(await stored()).toMatchObject({ phase: "reminded" });
+  });
+
   it.each([
     ["GET", "https://watch.test/state"],
     ["POST", "https://watch.test/"],
     ["DELETE", "https://watch.test/snooze?code=x"],
   ])("answers 404 for %s %s", async (method, url) => {
     expect((await request(0, method, url)).status).toBe(404);
+  });
+});
+
+describe("webhook registry", () => {
+  it("hides the endpoints when ADGUARD_WATCH_WEBHOOKS_TOKEN is unset, and refuses a wrong token", async () => {
+    expect((await admin("GET", "/webhooks", ADMIN, bindings({ ADGUARD_WATCH_WEBHOOKS_TOKEN: "" }))).status).toBe(404);
+    expect((await admin("GET", "/webhooks", { Authorization: "Bearer wrong" })).status).toBe(401);
+    expect((await admin("GET", "/webhooks", {})).status).toBe(401);
+    expect((await register({ name: "Sneaky", url: "https://bot2.test/x" }, { Authorization: "Bearer wrong" })).status).toBe(401);
+    expect(world.webhooks).toEqual([]);
+  });
+
+  it("sends a test message, saves the webhook, and lists it without its URL path or header values", async () => {
+    const res = await register({ name: "Slack", url: "https://bot2.test/secret-path", format: "slack", headers: { "X-Key": "k" } });
+    expect(res.status).toBe(201);
+    expect(world.webhooks).toEqual([
+      {
+        url: "https://bot2.test/secret-path",
+        auth: null,
+        contentType: "application/json",
+        payload: { text: 'AdGuard Protection Watch will send its reminders for "Slack" here.' },
+      },
+    ]);
+    const list = await (await admin("GET", "/webhooks")).json<Record<string, unknown>[]>();
+    expect(list.map((w) => ({ ...w, id: "…", added_at: "…" }))).toEqual([
+      { id: "…", name: "Bot", host: "bot.test", format: "json", header_names: [], added_at: "…" },
+      { id: "…", name: "Slack", host: "bot2.test", format: "slack", header_names: ["X-Key"], added_at: "…" },
+    ]);
+    expect(JSON.stringify(list)).not.toContain("secret-path");
+  });
+
+  it("replaces the webhook with the same URL instead of adding a second one", async () => {
+    const first = await (await register({ name: "Two", url: "https://bot2.test/x", headers: { Authorization: "Bearer old" } })).json<{ id: string }>();
+    const again = await register({ name: "Two renamed", url: "https://bot2.test/x", headers: { Authorization: "Bearer new" } });
+    expect(again.status).toBe(200);
+    expect((await again.json<{ id: string }>()).id).toBe(first.id);
+    world.webhooks = [];
+    world.setOff("d1");
+    await checkAt(0);
+    await checkAt(60);
+    expect(world.webhooks.map((w) => w.auth)).toEqual([null, "Bearer new"]);
+  });
+
+  it.each([
+    ["not an object", "[1]"],
+    ["no name", { url: "https://bot2.test/x" }],
+    ["plain http", { name: "x", url: "http://bot2.test/x" }],
+    ["unknown format", { name: "x", url: "https://bot2.test/x", format: "fax" }],
+    ["non-string header", { name: "x", url: "https://bot2.test/x", headers: { "X-Key": 1 } }],
+    ["invalid header name", { name: "x", url: "https://bot2.test/x", headers: { "bad header": "v" } }],
+  ])("rejects a webhook with %s (400)", async (_, body) => {
+    expect((await register(body)).status).toBe(400);
+    expect((await (await admin("GET", "/webhooks")).json<unknown[]>()).length).toBe(1);
+  });
+
+  it("doesn't save a webhook whose test message fails (422)", async () => {
+    world.webhookResponse = "500";
+    const res = await register({ name: "Broken", url: "https://bot2.test/x" });
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({ error: "the test message failed: HTTP 500" });
+    expect((await (await admin("GET", "/webhooks")).json<unknown[]>()).length).toBe(1);
+  });
+
+  it("removes a webhook, which then gets nothing, and answers 404 for an unknown id", async () => {
+    const [hook] = await (await admin("GET", "/webhooks")).json<{ id: string }[]>();
+    expect((await admin("DELETE", `/webhooks/${hook!.id}`)).status).toBe(204);
+    expect((await admin("DELETE", `/webhooks/${hook!.id}`)).status).toBe(404);
+    world.setOff("d1");
+    await checkAt(0);
+    await checkAt(60);
+    expect(world.webhooks).toEqual([]);
+  });
+
+  it("caps the list at 20 webhooks (409)", async () => {
+    for (let i = 2; i <= 20; i++) expect((await register({ name: `n${i}`, url: `https://bot2.test/${i}` })).status).toBe(201);
+    expect((await register({ name: "one too many", url: "https://bot2.test/21" })).status).toBe(409);
+    expect((await register({ name: "same URL is fine", url: "https://bot2.test/20" })).status).toBe(200);
+  });
+});
+
+describe("test endpoint", () => {
+  it("reads AdGuard and sends a test message to every webhook with its own headers and format", async () => {
+    await register({ name: "Slack", url: "https://bot2.test/x", format: "slack", headers: { "X-Key": "k" } });
+    world.webhooks = [];
+    world.setOff("d1");
+    const res = await admin("POST", "/webhooks/test");
+    expect(res.status).toBe(200);
+    const body = await res.json<{ webhooks: { id: string }[] }>();
+    expect({ ...body, webhooks: body.webhooks.map((w) => ({ ...w, id: "…" })) }).toEqual({
+      ok: true,
+      adguard: "ok",
+      off: ["MacBook Pro"],
+      webhooks: [
+        { id: "…", name: "Bot", ok: true },
+        { id: "…", name: "Slack", ok: true },
+      ],
+    });
+    const text = "Test from AdGuard Protection Watch: this webhook works, and AdGuard DNS protection is off for MacBook Pro.";
+    expect(world.webhooks.map(({ url, payload }) => ({ url, payload }))).toEqual([
+      { url: "https://bot.test/hook", payload: { event: "test", message: text } },
+      { url: "https://bot2.test/x", payload: { text } },
+    ]);
+    expect(await stored()).toBeNull();
+    expect(world.puts).toEqual([]);
+  });
+
+  it("answers 502 and names what failed when a webhook or AdGuard fails", async () => {
+    world.webhookResponse = "500";
+    world.adguardDown = true;
+    const res = await admin("POST", "/webhooks/test");
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({
+      ok: false,
+      adguard: "GET /v2/dns_servers: HTTP 503",
+      off: null,
+      webhooks: [{ name: "Bot", ok: false, error: "HTTP 500" }],
+    });
+    expect(world.webhooks[0]!.payload.message).toContain("could not read AdGuard DNS");
+  });
+
+  it("needs the token, and answers 409 with no webhooks", async () => {
+    expect((await admin("POST", "/webhooks/test", {})).status).toBe(401);
+    const [hook] = await (await admin("GET", "/webhooks")).json<{ id: string }[]>();
+    await admin("DELETE", `/webhooks/${hook!.id}`);
+    expect((await admin("POST", "/webhooks/test")).status).toBe(409);
+  });
+});
+
+describe("message formats", () => {
+  it.each([
+    ["slack", "application/json", (text: string) => ({ text })],
+    ["discord", "application/json", (text: string) => ({ content: text })],
+    ["text", "text/plain; charset=utf-8", (text: string) => text],
+  ] as const)("sends a %s reminder with a link to snooze or turn on", async (format, contentType, shape) => {
+    await register({ name: format, url: "https://bot2.test/x", format });
+    world.webhooks = [];
+    world.setOff("d1");
+    await checkAt(0);
+    await checkAt(60);
+    const code = (await stored())?.snoozeCode;
+    const sent = world.webhooks.find((w) => w.url === "https://bot2.test/x")!;
+    expect(sent.contentType).toBe(contentType);
+    expect(sent.payload).toEqual(
+      shape(
+        `AdGuard DNS protection is off for MacBook Pro (1h). It turns back on automatically in ~5 min. Snooze or turn it on: https://watch.test/snooze?code=${code}`,
+      ),
+    );
+  });
+});
+
+describe("turn on from the reminder", () => {
+  it("turns protection on, clears the reminder, and makes the code stop working", async () => {
+    const reminder = await remindedFromMinute0();
+    const res = await request(62, "POST", reminder.turn_on.url);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, turned_on: ["MacBook Pro"] });
+    expect(world.isOn("d1")).toBe(true);
+    expect(await stored()).toBeNull();
+    expect((await request(63, "POST", reminder.turn_on.url)).status).toBe(410);
+    expect((await request(63, "POST", reminder.snooze.url)).status).toBe(410);
+    await checkAt(65);
+    expect(events()).toEqual(["reminder"]);
+  });
+
+  it("refuses a wrong code (404) and a code with no pending reminder (410)", async () => {
+    await remindedFromMinute0();
+    expect((await request(62, "POST", "https://watch.test/turn-on?code=wrong")).status).toBe(404);
+    expect(world.puts).toEqual([]);
+    world.setOff("d1", false);
+    await checkAt(63);
+    expect((await request(63, "POST", "https://watch.test/turn-on?code=anything")).status).toBe(410);
+  });
+
+  it("keeps the reminder when a switch fails to turn on, so the auto turn-on retries it", async () => {
+    world.setOff("d2");
+    world.failingPuts.add("d1");
+    const reminder = await remindedFromMinute0();
+    const res = await request(62, "POST", reminder.turn_on.url);
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ ok: false, turned_on: ["iPhone"], failed: ["MacBook Pro"] });
+    expect(await stored()).toMatchObject({ phase: "reminded" });
+    world.failingPuts.clear();
+    await checkAt(65);
+    expect(world.isOn("d1")).toBe(true);
+  });
+
+  it("answers 502 and leaves the reminder when AdGuard is down", async () => {
+    const reminder = await remindedFromMinute0();
+    world.adguardDown = true;
+    expect((await request(62, "POST", reminder.turn_on.url)).status).toBe(502);
+    expect(await stored()).toMatchObject({ phase: "reminded" });
+  });
+
+  it("shows a turn-on button on the reminder page, and the button's POST turns protection on", async () => {
+    const reminder = await remindedFromMinute0();
+    const page = await (await request(62, "GET", reminder.snooze.url)).text();
+    const code = encodeURIComponent((await stored())!.snoozeCode as string);
+    expect(page).toContain(`<form method="post" action="/turn-on?code=${code}">`);
+    const res = await request(62, "POST", reminder.turn_on.url, { body: new URLSearchParams() });
+    expect(res.headers.get("content-type")).toContain("text/html");
+    expect(await res.text()).toContain("MacBook Pro");
+    expect(world.isOn("d1")).toBe(true);
   });
 });
