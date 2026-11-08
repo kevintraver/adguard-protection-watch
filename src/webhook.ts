@@ -122,7 +122,7 @@ export async function send(
   webhook: Pick<Webhook, "url" | "headers" | "format" | "signing">,
   message: Message,
 ): Promise<string | null> {
-  const { body, contentType } = render(webhook.format, message);
+  const { body, contentType } = render(webhook.format, message, Date.now());
   const headers: Record<string, string> = { ...webhook.headers, "Content-Type": contentType };
   if (webhook.signing) {
     const { header, prefix, secret } = webhook.signing;
@@ -143,16 +143,18 @@ async function hmacSha256Hex(secret: string, body: string): Promise<string> {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function render(format: Format, { payload, text }: Message): { body: string; contentType: string } {
+/** Every message carries the moment it was sent (UTC), so a test or reminder can be matched to the Worker's logs. */
+function render(format: Format, { payload, text }: Message, now: number): { body: string; contentType: string } {
+  const stamped = `${text} (sent ${iso(now).slice(11, 19)} UTC)`;
   switch (format) {
     case "json":
-      return { body: JSON.stringify(payload), contentType: "application/json" };
+      return { body: JSON.stringify({ ...payload, sent_at: iso(now) }), contentType: "application/json" };
     case "slack":
-      return { body: JSON.stringify({ text }), contentType: "application/json" };
+      return { body: JSON.stringify({ text: stamped }), contentType: "application/json" };
     case "discord":
-      return { body: JSON.stringify({ content: text }), contentType: "application/json" };
+      return { body: JSON.stringify({ content: stamped }), contentType: "application/json" };
     case "text":
-      return { body: text, contentType: "text/plain; charset=utf-8" };
+      return { body: stamped, contentType: "text/plain; charset=utf-8" };
   }
 }
 

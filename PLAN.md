@@ -165,6 +165,8 @@ The Worker sends a `POST` to every registered webhook at once, each with its own
 
 For `slack`, `discord` and `text`, a reminder reads "AdGuard DNS protection is off for MacBook Pro (1h). It turns back on automatically in ~5 min. Snooze or turn it on: <link>". The link opens the page with both buttons, so a plain notification is enough without a bot.
 
+Every message carries the time it was sent, so a message can be matched to the Worker's logs: `sent_at` (UTC, ISO 8601) in `json`, and "(sent 20:07:00 UTC)" at the end of the sentence in the other formats.
+
 ```json
 {
   "event": "reminder",
@@ -175,7 +177,8 @@ For `slack`, `discord` and `text`, a reminder reads "AdGuard DNS protection is o
     { "kind": "device", "id": "<device-id>", "name": "MacBook Pro" }
   ],
   "snooze": { "method": "POST", "url": "https://<worker>/snooze?code=…", "params": { "minutes": "integer, default 60" } },
-  "turn_on": { "method": "POST", "url": "https://<worker>/turn-on?code=…" }
+  "turn_on": { "method": "POST", "url": "https://<worker>/turn-on?code=…" },
+  "sent_at": "2026-11-04T20:07:00.000Z"
 }
 ```
 
@@ -186,7 +189,8 @@ For `slack`, `discord` and `text`, a reminder reads "AdGuard DNS protection is o
   "off_since": "2026-11-04T19:02:00Z",
   "off": [
     { "kind": "device", "id": "<device-id>", "name": "MacBook Pro" }
-  ]
+  ],
+  "sent_at": "2026-11-04T20:12:00.000Z"
 }
 ```
 
