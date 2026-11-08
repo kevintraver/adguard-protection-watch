@@ -82,6 +82,18 @@ export function autoEnabledMessage(
   };
 }
 
+/** The on-demand check: says what the Worker can see in AdGuard right now. */
+export function checkMessage(off: Switch[] | null): Message {
+  const status =
+    off === null
+      ? "but it could not read AdGuard DNS (see the Worker logs)"
+      : off.length === 0
+        ? "and AdGuard DNS protection is on everywhere"
+        : `and AdGuard DNS protection is off for ${describe(off)}`;
+  const message = `Test from AdGuard Protection Watch: this webhook works, ${status}.`;
+  return { payload: { event: "test", message }, text: message };
+}
+
 export function testMessage(name: string): Message {
   const message = `AdGuard Protection Watch will send its reminders for "${name}" here.`;
   return { payload: { event: "test", message }, text: message };

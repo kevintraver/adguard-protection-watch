@@ -704,6 +704,54 @@ describe("webhook registry", () => {
   });
 });
 
+describe("test endpoint", () => {
+  it("reads AdGuard and sends a test message to every webhook with its own headers and format", async () => {
+    await register({ name: "Slack", url: "https://bot2.test/x", format: "slack", headers: { "X-Key": "k" } });
+    world.webhooks = [];
+    world.setOff("d1");
+    const res = await admin("POST", "/webhooks/test");
+    expect(res.status).toBe(200);
+    const body = await res.json<{ webhooks: { id: string }[] }>();
+    expect({ ...body, webhooks: body.webhooks.map((w) => ({ ...w, id: "…" })) }).toEqual({
+      ok: true,
+      adguard: "ok",
+      off: ["MacBook Pro"],
+      webhooks: [
+        { id: "…", name: "Bot", ok: true },
+        { id: "…", name: "Slack", ok: true },
+      ],
+    });
+    const text = "Test from AdGuard Protection Watch: this webhook works, and AdGuard DNS protection is off for MacBook Pro.";
+    expect(world.webhooks.map(({ url, payload }) => ({ url, payload }))).toEqual([
+      { url: "https://bot.test/hook", payload: { event: "test", message: text } },
+      { url: "https://bot2.test/x", payload: { text } },
+    ]);
+    expect(await stored()).toBeNull();
+    expect(world.puts).toEqual([]);
+  });
+
+  it("answers 502 and names what failed when a webhook or AdGuard fails", async () => {
+    world.webhookResponse = "500";
+    world.adguardDown = true;
+    const res = await admin("POST", "/webhooks/test");
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({
+      ok: false,
+      adguard: "GET /v2/dns_servers: HTTP 503",
+      off: null,
+      webhooks: [{ name: "Bot", ok: false, error: "HTTP 500" }],
+    });
+    expect(world.webhooks[0]!.payload.message).toContain("could not read AdGuard DNS");
+  });
+
+  it("needs the token, and answers 409 with no webhooks", async () => {
+    expect((await admin("POST", "/webhooks/test", {})).status).toBe(401);
+    const [hook] = await (await admin("GET", "/webhooks")).json<{ id: string }[]>();
+    await admin("DELETE", `/webhooks/${hook!.id}`);
+    expect((await admin("POST", "/webhooks/test")).status).toBe(409);
+  });
+});
+
 describe("message formats", () => {
   it.each([
     ["slack", "application/json", (text: string) => ({ text })],

@@ -52,6 +52,13 @@ You need an AdGuard DNS API key and a Cloudflare API token from the "Edit Cloudf
 
    `headers` is optional and goes only to that webhook. `format` is `json` (the default, for bots), `slack`, `discord` or `text` (plain text, such as ntfy). `GET /webhooks` lists them and `DELETE /webhooks/{id}` removes one. A bot that holds `ADGUARD_WATCH_WEBHOOKS_TOKEN` can add itself. Posting the same URL again updates that entry. See [Managing webhooks](PLAN.md#managing-webhooks).
 
+   To check that everything works at any time, send a test message to every webhook. The reply says whether AdGuard and each webhook worked.
+
+   ```sh
+   curl -X POST https://adguard-protection-watch.<subdomain>.workers.dev/webhooks/test \
+     -H "Authorization: Bearer $ADGUARD_WATCH_WEBHOOKS_TOKEN"
+   ```
+
 5. For a bot, save the bot rules from [PLAN.md](PLAN.md#bot-rules) in the bot's own instructions. The webhook carries data only, so the bot needs those rules to act on a reply. Slack, Discord and text messages carry a link to a page with "Turn protection on now" and "Snooze" buttons instead.
 
 The timings live in `vars` in `wrangler.jsonc`. `REMIND_AFTER_MIN` defaults to 60, `AUTO_ENABLE_AFTER_MIN` to 5, and `DEFAULT_SNOOZE_MIN` to 60. A missing or invalid value falls back to its default.

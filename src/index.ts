@@ -1,7 +1,7 @@
 import { checkCode, type Switch } from "./domain";
 import { parseMinutes, parseSettings, type Settings } from "./config";
 import { enableAll, readSwitches } from "./adguard";
-import { autoEnabledMessage, notify, parseWebhookInput, publicView, send, testMessage, type Webhook } from "./webhook";
+import { autoEnabledMessage, checkMessage, notify, parseWebhookInput, publicView, send, testMessage, type Webhook } from "./webhook";
 import type { WatchKeeper } from "./watch-keeper";
 
 export { WatchKeeper } from "./watch-keeper";
@@ -134,11 +134,41 @@ async function webhooks(request: Request, url: URL, settings: Settings, keeper: 
     return Response.json(publicView(saved.webhook), { status: saved.created ? 201 : 200 });
   }
 
+  if (id === "test" && request.method === "POST") return testAll(settings, keeper);
+
   if (id !== null && request.method === "DELETE") {
     return (await keeper.removeWebhook(id)) ? new Response(null, { status: 204 }) : new Response("Not found", { status: 404 });
   }
 
   return new Response("Not found", { status: 404 });
+}
+
+/** Checks the whole path on demand: the AdGuard key, then every webhook with its own headers. */
+async function testAll(settings: Settings, keeper: Keeper): Promise<Response> {
+  const list = await keeper.webhooks();
+  if (list.length === 0) return Response.json({ error: "no webhooks are registered" }, { status: 409 });
+
+  let off: Switch[] | null = null;
+  let adguard = "ok";
+  try {
+    off = (await readSwitches(settings.adguard)).filter((s) => !s.enabled);
+  } catch (err) {
+    console.error("Test: could not read AdGuard protection", err);
+    adguard = err instanceof Error ? err.message : String(err);
+  }
+
+  const message = checkMessage(off);
+  const webhooks = await Promise.all(
+    list.map(async (webhook) => {
+      const error = await send(webhook, message);
+      return { id: webhook.id, name: webhook.name, ...(error ? { ok: false, error } : { ok: true }) };
+    }),
+  );
+  const ok = adguard === "ok" && webhooks.every((w) => w.ok);
+  return Response.json(
+    { ok, adguard, off: off?.map((s) => s.name) ?? null, webhooks },
+    { status: ok ? 200 : 502 },
+  );
 }
 
 function authorized(request: Request, token: string): boolean {

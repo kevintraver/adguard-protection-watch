@@ -131,6 +131,7 @@ The error path's `auto_enabled` message says "The protection check hit an error,
 | `POST` | `/webhooks` | Adds a webhook (admin). |
 | `GET` | `/webhooks` | Lists webhooks (admin). |
 | `DELETE` | `/webhooks/{id}` | Removes a webhook (admin). |
+| `POST` | `/webhooks/test` | Checks everything on demand (admin): reads AdGuard, then sends a `test` message to every webhook. Changes no state. |
 
 If a reminder code is wrong or missing, the Worker returns `404`. If no reminder is pending, it returns `410 Gone`. Either way nothing changes, so auto turn-on still happens on schedule. Snooze and turn-on share the code, so whichever is used first wins.
 
@@ -147,6 +148,7 @@ curl -X POST https://<worker>/webhooks \
 - `name` (1 to 100 characters) and `url` (`https`) are required. `headers` is optional and goes only to this webhook. `format` defaults to `json`.
 - The Worker sends a `test` message first and saves the webhook only if it gets a 2xx. Otherwise it answers `422` with the error.
 - Adding a URL that's already in the list replaces that entry and keeps its ID (`200`), so a bot can register itself again safely. A new one gets `201`. The list holds at most 20 (`409` past that).
+- `POST /webhooks/test` reads AdGuard and sends every webhook a `test` message saying what's off right now, e.g. "this webhook works, and AdGuard DNS protection is on everywhere". It answers `{ ok, adguard, off, webhooks: [{ id, name, ok, error? }] }`: `200` if AdGuard and every webhook worked, `502` otherwise, `409` with no webhooks.
 - Responses and `GET /webhooks` show `id`, `name`, the URL's `host`, `format`, `header_names` and `added_at`, never the full URL or header values. Slack and Discord URLs are secrets themselves.
 
 ## Webhook payload
@@ -277,6 +279,7 @@ Unit tests use a mocked AdGuard API, a mocked webhook, and a fake clock.
 - `/webhooks` answers 404 without `ADGUARD_WATCH_WEBHOOKS_TOKEN` and 401 with a wrong token.
 - Adding sends a test message; a failed test (422) or invalid input (400) saves nothing. The list never shows URL paths or header values.
 - The same URL replaces its entry; the list caps at 20; deleting stops messages.
+- `POST /webhooks/test` reports AdGuard and each webhook separately, answers 502 if any failed, and changes no state.
 - Each webhook gets only its own headers. `slack`, `discord` and `text` bodies carry the link page.
 - `POST /turn-on` turns protection on and retires the code; a failed switch keeps the reminder; AdGuard down returns 502; a GET never acts.
 
