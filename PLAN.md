@@ -146,10 +146,11 @@ curl -X POST https://<worker>/webhooks \
 ```
 
 - `name` (1 to 100 characters) and `url` (`https`) are required. `headers` is optional and goes only to this webhook. `format` defaults to `json`.
+- `signing` is optional, for webhooks that verify each message: `{"secret": "…", "header": "X-Signature-256", "prefix": "sha256="}` (header and prefix shown are the defaults). The Worker signs the exact body it sends with HMAC-SHA256 and sends `prefix + hex digest` in that header. The secret is stored with the webhook and never shown.
 - The Worker sends a `test` message first and saves the webhook only if it gets a 2xx. Otherwise it answers `422` with the error.
 - Adding a URL that's already in the list replaces that entry and keeps its ID (`200`), so a bot can register itself again safely. A new one gets `201`. The list holds at most 20 (`409` past that).
 - `POST /webhooks/test` reads AdGuard and sends every webhook a `test` message saying what's off right now, e.g. "this webhook works, and AdGuard DNS protection is on everywhere". It answers `{ ok, adguard, off, webhooks: [{ id, name, ok, error? }] }`: `200` if AdGuard and every webhook worked, `502` otherwise, `409` with no webhooks.
-- Responses and `GET /webhooks` show `id`, `name`, the URL's `host`, `format`, `header_names` and `added_at`, never the full URL or header values. Slack and Discord URLs are secrets themselves.
+- Responses and `GET /webhooks` show `id`, `name`, the URL's `host`, `format`, `header_names`, `signature_header` and `added_at`, never the full URL, header values or signing secret. Slack and Discord URLs are secrets themselves.
 
 ## Webhook payload
 
@@ -280,7 +281,8 @@ Unit tests use a mocked AdGuard API, a mocked webhook, and a fake clock.
 - Adding sends a test message; a failed test (422) or invalid input (400) saves nothing. The list never shows URL paths or header values.
 - The same URL replaces its entry; the list caps at 20; deleting stops messages.
 - `POST /webhooks/test` reports AdGuard and each webhook separately, answers 502 if any failed, and changes no state.
-- Each webhook gets only its own headers. `slack`, `discord` and `text` bodies carry the link page.
+- Each webhook gets only its own headers. A `signing` webhook gets `sha256=<HMAC-SHA256 of the exact body>`, the secret is never listed, and bad signing input is rejected.
+- `slack`, `discord` and `text` bodies carry the link page.
 - `POST /turn-on` turns protection on and retires the code; a failed switch keeps the reminder; AdGuard down returns 502; a GET never acts.
 
 **Concurrency:**

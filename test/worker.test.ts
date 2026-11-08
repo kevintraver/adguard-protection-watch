@@ -25,6 +25,7 @@ class World {
   webhookResponse: "ok" | "500" | "network error" = "ok";
   puts: string[] = [];
   webhooks: { url: string; auth: string | null; contentType: string | null; payload: any }[] = [];
+  signatures: { raw: string; signature: string | null }[] = [];
   onWebhook: ((payload: any) => Promise<void>) | null = null;
   slowMs: Partial<Record<string, number>> = {};
   started: string[] = [];
@@ -43,7 +44,9 @@ class World {
     const url = new URL(request.url);
     if (url.origin === "https://bot.test" || url.origin === "https://bot2.test") {
       const contentType = request.headers.get("content-type");
-      const payload = contentType?.startsWith("application/json") ? await request.json() : await request.text();
+      const raw = await request.text();
+      const payload = contentType?.startsWith("application/json") ? JSON.parse(raw) : raw;
+      this.signatures.push({ raw, signature: request.headers.get("x-signature-256") });
       this.webhooks.push({ url: url.href, auth: request.headers.get("authorization"), contentType, payload });
       await this.onWebhook?.(payload);
       if (this.webhookResponse === "network error") throw new TypeError("network connection lost");
@@ -96,6 +99,7 @@ beforeEach(async () => {
   vi.spyOn(console, "warn").mockImplementation(() => {});
   expect((await register({ name: "Bot", url: "https://bot.test/hook" })).status).toBe(201);
   world.webhooks = [];
+  world.signatures = [];
 });
 
 afterEach(() => {
@@ -649,8 +653,8 @@ describe("webhook registry", () => {
     ]);
     const list = await (await admin("GET", "/webhooks")).json<Record<string, unknown>[]>();
     expect(list.map((w) => ({ ...w, id: "…", added_at: "…" }))).toEqual([
-      { id: "…", name: "Bot", host: "bot.test", format: "json", header_names: [], added_at: "…" },
-      { id: "…", name: "Slack", host: "bot2.test", format: "slack", header_names: ["X-Key"], added_at: "…" },
+      { id: "…", name: "Bot", host: "bot.test", format: "json", header_names: [], signature_header: null, added_at: "…" },
+      { id: "…", name: "Slack", host: "bot2.test", format: "slack", header_names: ["X-Key"], signature_header: null, added_at: "…" },
     ]);
     expect(JSON.stringify(list)).not.toContain("secret-path");
   });
@@ -701,6 +705,50 @@ describe("webhook registry", () => {
     for (let i = 2; i <= 20; i++) expect((await register({ name: `n${i}`, url: `https://bot2.test/${i}` })).status).toBe(201);
     expect((await register({ name: "one too many", url: "https://bot2.test/21" })).status).toBe(409);
     expect((await register({ name: "same URL is fine", url: "https://bot2.test/20" })).status).toBe(200);
+  });
+});
+
+async function hmacHex(secret: string, body: string) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return [...new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(body)))]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+describe("signed webhooks", () => {
+  it("signs every body with HMAC-SHA256 under the webhook's own secret, and never shows the secret", async () => {
+    const res = await register({ name: "Signed", url: "https://bot2.test/s", signing: { secret: "vault-secret" } });
+    expect(res.status).toBe(201);
+    expect(await res.json()).toMatchObject({ signature_header: "X-Signature-256" });
+    world.setOff("d1");
+    await checkAt(0);
+    await checkAt(60);
+
+    const signed = world.signatures.filter((_, i) => world.webhooks[i]!.url === "https://bot2.test/s");
+    expect(signed.map((s) => JSON.parse(s.raw).event)).toEqual(["test", "reminder"]);
+    for (const { raw, signature } of signed) expect(signature).toBe(`sha256=${await hmacHex("vault-secret", raw)}`);
+    const unsigned = world.signatures.filter((_, i) => world.webhooks[i]!.url === "https://bot.test/hook");
+    expect(unsigned.map((s) => s.signature)).toEqual([null]);
+
+    const list = await (await admin("GET", "/webhooks")).text();
+    expect(list).not.toContain("vault-secret");
+    expect(list).toContain('"signature_header":"X-Signature-256"');
+  });
+
+  it("uses a custom signature header and prefix", async () => {
+    await register({ name: "Custom", url: "https://bot2.test/c", signing: { secret: "s", header: "X-Signature-256", prefix: "" } });
+    const { raw, signature } = world.signatures.at(-1)!;
+    expect(signature).toBe(await hmacHex("s", raw));
+  });
+
+  it.each([
+    ["no secret", {}],
+    ["an empty secret", { secret: "" }],
+    ["a bad header name", { secret: "s", header: "bad header" }],
+    ["not an object", "s"],
+  ])("rejects signing with %s (400)", async (_, signing) => {
+    expect((await register({ name: "x", url: "https://bot2.test/x", signing })).status).toBe(400);
   });
 });
 
