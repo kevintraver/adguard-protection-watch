@@ -50,7 +50,7 @@ You need an AdGuard DNS API key and a Cloudflare API token from the "Edit Cloudf
      -d '{"name": "My bot", "url": "https://…", "headers": {"Authorization": "Bearer …"}}'
    ```
 
-   `headers` is optional and goes only to that webhook. `format` is `json` (the default, for bots), `slack`, `discord` or `text` (plain text, such as ntfy). `GET /webhooks` lists them and `DELETE /webhooks/{id}` removes one. A bot that holds `ADGUARD_WATCH_WEBHOOKS_TOKEN` can add itself. Posting the same URL again updates that entry. See [Managing webhooks](PLAN.md#managing-webhooks).
+   `headers` is optional and goes only to that webhook. For a webhook that checks a signature, add `"signing": {"secret": "…"}`: each body is signed with HMAC-SHA256 and sent as `X-Signature-256: sha256=<hex>` (the header and prefix can be changed). `format` is `json` (the default, for bots), `slack`, `discord` or `text` (plain text, such as ntfy). `GET /webhooks` lists them and `DELETE /webhooks/{id}` removes one. A bot that holds `ADGUARD_WATCH_WEBHOOKS_TOKEN` can add itself. Posting the same URL again updates that entry. See [Managing webhooks](PLAN.md#managing-webhooks).
 
    To check that everything works at any time, send a test message to every webhook. The reply says whether AdGuard and each webhook worked.
 

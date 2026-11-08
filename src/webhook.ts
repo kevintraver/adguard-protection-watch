@@ -10,8 +10,12 @@ export type Webhook = {
   url: string;
   headers: Record<string, string>;
   format: Format;
+  /** Signs each body with HMAC-SHA256 and sends `prefix + hex digest` in `header`, for webhooks that verify a signature. */
+  signing?: Signing;
   addedAt: number;
 };
+
+export type Signing = { header: string; prefix: string; secret: string };
 
 export type WebhookInput = Omit<Webhook, "id" | "addedAt">;
 
@@ -114,18 +118,29 @@ export async function notify(webhooks: Webhook[], message: Message): Promise<voi
 }
 
 /** Returns why the send failed, or null when the webhook answered with a 2xx. */
-export async function send(webhook: Pick<Webhook, "url" | "headers" | "format">, message: Message): Promise<string | null> {
+export async function send(
+  webhook: Pick<Webhook, "url" | "headers" | "format" | "signing">,
+  message: Message,
+): Promise<string | null> {
   const { body, contentType } = render(webhook.format, message);
+  const headers: Record<string, string> = { ...webhook.headers, "Content-Type": contentType };
+  if (webhook.signing) {
+    const { header, prefix, secret } = webhook.signing;
+    headers[header] = prefix + (await hmacSha256Hex(secret, body));
+  }
   try {
-    const res = await fetch(webhook.url, {
-      method: "POST",
-      headers: { ...webhook.headers, "Content-Type": contentType },
-      body,
-    });
+    const res = await fetch(webhook.url, { method: "POST", headers, body });
     return res.ok ? null : `HTTP ${res.status}`;
   } catch (err) {
     return err instanceof Error ? err.message : String(err);
   }
+}
+
+async function hmacSha256Hex(secret: string, body: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const digest = await crypto.subtle.sign("HMAC", key, encoder.encode(body));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function render(format: Format, { payload, text }: Message): { body: string; contentType: string } {
@@ -160,7 +175,13 @@ export function parseWebhookInput(raw: unknown): Parsed<WebhookInput> {
   const headers = parseHeaders(body.headers ?? {});
   if (!headers.ok) return headers;
 
-  return { ok: true, value: { name, url: body.url, headers: headers.value, format: format as Format } };
+  const value: WebhookInput = { name, url: body.url, headers: headers.value, format: format as Format };
+  if (body.signing !== undefined) {
+    const signing = parseSigning(body.signing);
+    if (!signing.ok) return signing;
+    value.signing = signing.value;
+  }
+  return { ok: true, value };
 }
 
 /** Rebuilds a webhook read back from storage, so a corrupt entry fails loudly instead of sending somewhere odd. */
@@ -173,8 +194,29 @@ export function parseStoredWebhook(raw: unknown): Webhook {
   return { id: stored.id, addedAt: stored.addedAt, ...input.value };
 }
 
-export function publicView({ id, name, url, format, headers, addedAt }: Webhook) {
-  return { id, name, host: new URL(url).host, format, header_names: Object.keys(headers), added_at: iso(addedAt) };
+export function publicView({ id, name, url, format, headers, signing, addedAt }: Webhook) {
+  return {
+    id,
+    name,
+    host: new URL(url).host,
+    format,
+    header_names: Object.keys(headers),
+    signature_header: signing?.header ?? null,
+    added_at: iso(addedAt),
+  };
+}
+
+function parseSigning(raw: unknown): Parsed<Signing> {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return fail("signing must be an object");
+  const { secret, header = "X-Signature-256", prefix = "sha256=" } = raw as Record<string, unknown>;
+  if (typeof secret !== "string" || secret.length < 1 || secret.length > 1000) return fail("signing.secret must be 1 to 1000 characters");
+  if (typeof header !== "string" || typeof prefix !== "string") return fail("signing.header and signing.prefix must be strings");
+  try {
+    new Headers([[header, prefix]]);
+  } catch {
+    return fail("signing.header is not a valid header name");
+  }
+  return { ok: true, value: { header, prefix, secret } };
 }
 
 function parseHeaders(raw: unknown): Parsed<Record<string, string>> {
