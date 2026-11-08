@@ -4,7 +4,7 @@
 
 You turn off AdGuard DNS protection to get past something it's blocking, then forget to turn it back on. AdGuard DNS has no "turn off for an hour" option.
 
-AdGuard Protection Watch is a small Cloudflare Worker that notices. Once protection has been off for an hour, it sends a reminder to a chat bot (or any webhook). You can snooze it or turn protection back on. If you don't answer, the Worker turns protection back on by itself.
+AdGuard Protection Watch is a small Cloudflare Worker that notices. Once protection has been off for an hour, it sends a reminder to every registered webhook: a chat bot, Slack, Discord, ntfy or anything else that takes a POST. You can snooze it or turn protection back on. If you don't answer, the Worker turns protection back on by itself.
 
 ## Fail-safe rule
 
@@ -13,6 +13,7 @@ AdGuard Protection Watch is a small Cloudflare Worker that notices. Once protect
 | Failure | What happens |
 |---|---|
 | A reminder webhook fails (bot down, URL changed) | It still counts as sent, and protection is turned on at the next check. |
+| No webhooks are registered, or the stored webhook list is corrupt | Nothing is sent, but the reminder still counts as sent, so protection is turned on at the next check. |
 | The Durable Object's storage fails, or the Durable Object can't be reached, while protection is off | Protection is turned on. |
 | Any unexpected error in the check while protection is off | Protection is turned on. |
 | A setting is missing or invalid (`REMIND_AFTER_MIN`, etc.) | The default is used (60 / 5 / 60). |
@@ -28,7 +29,7 @@ AdGuard Protection Watch is a small Cloudflare Worker that notices. Once protect
    - **Not the account-wide toggle at the top of Home.** The public API can't see or change that one, so the Worker would never notice it. Use a device or server toggle instead.
 2. A Worker cron checks every 5 minutes. It reads the server and every device on it. Devices are listed fresh each time, so new devices are covered automatically. **One shared timer:** protection counts as "off" if any switch is off. The first check that finds anything off records `off_since`. The timer keeps running until *every* switch is back on, even if the set of off switches changes in between.
 3. Once something has been off for `REMIND_AFTER_MIN` (60), the Worker sends a **reminder** webhook listing what's off (e.g. "MacBook Pro"). You can reply to the bot:
-   - **"turn on"**: the bot turns on every switch in the reminder's `off` list, using its own AdGuard API access. The Worker sees everything on at the next check and clears its state.
+   - **"turn on"**: the bot POSTs the reminder's `turn_on.url`, or turns the switches on with its own AdGuard API access. The reminder's link page has a "Turn protection on now" button that does the same.
    - **"snooze"**: no reminders for 1 hour. "snooze 20m" or "snooze 3h" picks the length. There's no limit on how long a snooze lasts or how many times in a row you snooze. A snooze covers everything that's off, including a switch turned off during the snooze. When the snooze ends, the next check sends a new reminder.
 4. If there's no reply within `AUTO_ENABLE_AFTER_MIN` (5) of a reminder, the Worker turns on **every switch that's off at that moment** and sends an **auto_enabled** webhook listing them.
 5. When a check finds every switch on, whether you turned them on, the bot did, the Worker did, or anyone else did, the stored state is cleared. The next time anything goes off, the cycle starts fresh.
@@ -48,15 +49,14 @@ Cloudflare cron ───────▶ Worker.scheduled()
                            │  read/write the stored Watch
                            │  PUT …/settings on each off switch  (auto turn-on)
                            ▼
-                     POST WEBHOOK_URLS ──▶ chat bot ──▶ you
-                                              │           │
-                                              │◀──────────┘ "snooze" / "turn on"
-     WatchKeeper.snooze() ◀─ Worker.fetch() ◀─┤ snooze: POST snooze URL
-                     AdGuard API    ◀─────────┘ turn on: bot's own AdGuard access
+                     POST each registered webhook ──▶ chat bot / Slack / … ──▶ you
+                                                                               │
+   WatchKeeper.snooze() / turnOn() ◀─ Worker.fetch() ◀─ POST snooze or turn-on ┘
+                                                        URL (bot or link page)
 ```
 
 - **Runtime:** a Cloudflare Worker on the free plan, written in TypeScript.
-- **State:** one SQLite-backed Durable Object, `WatchKeeper`, with a single instance named `watch`. It owns the stored `Watch`, so every read sees the last write.
+- **State:** one SQLite-backed Durable Object, `WatchKeeper`, with a single instance named `watch`. It owns the stored `Watch` and the webhook list, so every read sees the last write. A webhook added through the API gets the next message with no redeploy.
 - **AdGuard API:** `https://api.adguard-dns.io/oapi`, with the header `Authorization: ApiKey <key>`.
   - Reading, two calls per check:
     - `GET /oapi/v2/dns_servers`: the server with `ADGUARD_SERVER_ID`, `settings.protection_enabled`.
@@ -76,7 +76,9 @@ type Watch =
 
 The Durable Object stores the `Watch` under the key `watch`. If the key is missing, protection was on at the last check. Stored state that doesn't parse as a `Watch` counts as an error, so the fail-safe turns protection on.
 
-The decisions live in two pure functions in `src/domain.ts`. `decide(watch, off, now, config, newCode)` returns the next `Watch` and at most one effect (`remind` or `turnOn`). `applySnooze(watch, code, minutes, now)` handles the snooze endpoint. Everything with side effects (AdGuard, storage, webhooks) is in `src/index.ts`, `src/watch-keeper.ts` and the modules they call.
+The webhook list lives under the key `webhooks`: `{ id, name, url, headers, format, addedAt }[]`, at most 20. A corrupt list means no messages, never a missed turn-on: the check saves its state first, then reads the list.
+
+The decisions live in two pure functions in `src/domain.ts`. `decide(watch, off, now, config, newCode)` returns the next `Watch` and at most one effect (`remind` or `turnOn`). `applySnooze(watch, code, minutes, now)` handles the snooze endpoint, and `checkCode(watch, code)` the one-time code that snooze and turn-on share. Everything with side effects (AdGuard, storage, webhooks) is in `src/index.ts`, `src/watch-keeper.ts` and the modules they call.
 
 The Worker reads AdGuard, then calls the Durable Object, which runs `decide`, any auto turn-on PUTs and the webhooks. A snooze also runs inside the Durable Object. While a check reads the state, runs any PUTs and writes the result, it holds incoming snoozes back (`blockConcurrencyWhile`). A snooze that arrives during an auto turn-on therefore waits and gets `410`. One that arrives before the check reads the state wins, and nothing is turned on. Webhooks go out after that, so a slow bot never holds snoozes back.
 
@@ -114,23 +116,51 @@ turnOn(off):
   POST webhooks { event: "auto_enabled", off: the ones that turned on }   # best effort
 ```
 
+If the Durable Object can't be reached, the fail-safe still turns protection on, but it can't send `auto_enabled`, because the webhook list lives in the Durable Object.
+
 The error path's `auto_enabled` message says "The protection check hit an error, so AdGuard DNS protection is back on for …". That message has no `off_since`, because the Worker's fail-safe doesn't read the stored state. A rare duplicate is accepted: if the storage delete fails after every PUT succeeded, the fail-safe repeats the (harmless) PUTs and sends a second `auto_enabled` message.
 
 ## HTTP endpoints (`fetch`)
 
-The Worker accepts only one action, snooze. Turning protection on goes through the bot's own AdGuard access.
-
 | Method | Path | What it does |
 |---|---|---|
 | `POST` | `/snooze?code=…&minutes=N` | `N` defaults to 60 and must be a whole number of at least 1, with no upper limit. Sets `snooze_until = now + N` and clears `reminded_at` and `snooze_code`, so the link stops working after one use. Returns `200 {"ok":true,"snooze_until":…}`. |
-| `GET` | `/snooze?code=…` | A small HTML page with a minutes box and a "Snooze" button that POSTs to the same URL. **A GET never snoozes**, so link previews and prefetching can't trigger anything. |
+| `POST` | `/turn-on?code=…` | Reads AdGuard, turns on every switch that's off, and clears the reminder. Returns `200 {"ok":true,"turned_on":[names]}`. If a switch fails, returns `502` with `failed`, and the reminder stays so its auto turn-on retries. If AdGuard can't be read, returns `502` and changes nothing. |
+| `GET` | `/snooze?code=…` | A small HTML page with a "Turn protection on now" button, a minutes box and a "Snooze" button. **A GET never acts**, so link previews and prefetching can't trigger anything. |
 | `GET` | `/` | Returns `200 ok` (health check). Shows no state. |
+| `POST` | `/webhooks` | Adds a webhook (admin). |
+| `GET` | `/webhooks` | Lists webhooks (admin). |
+| `DELETE` | `/webhooks/{id}` | Removes a webhook (admin). |
 
-If the code is wrong or missing, the Worker returns `404`. If no reminder is pending, it returns `410 Gone`. Either way nothing changes, so auto turn-on still happens on schedule.
+If a reminder code is wrong or missing, the Worker returns `404`. If no reminder is pending, it returns `410 Gone`. Either way nothing changes, so auto turn-on still happens on schedule. Snooze and turn-on share the code, so whichever is used first wins.
+
+### Managing webhooks
+
+The `/webhooks` endpoints need `Authorization: Bearer <ADMIN_TOKEN>`. Without the `ADMIN_TOKEN` secret they answer `404`. The token guards more than the list: whoever holds a webhook receives snooze codes and could keep snoozing, so only someone you trust should be able to add one.
+
+```sh
+curl -X POST https://<worker>/webhooks \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"name": "Grok bot", "url": "https://…", "headers": {"Authorization": "Bearer …"}, "format": "json"}'
+```
+
+- `name` (1 to 100 characters) and `url` (`https`) are required. `headers` is optional and goes only to this webhook. `format` defaults to `json`.
+- The Worker sends a `test` message first and saves the webhook only if it gets a 2xx. Otherwise it answers `422` with the error.
+- Adding a URL that's already in the list replaces that entry and keeps its ID (`200`), so a bot can register itself again safely. A new one gets `201`. The list holds at most 20 (`409` past that).
+- Responses and `GET /webhooks` show `id`, `name`, the URL's `host`, `format`, `header_names` and `added_at`, never the full URL or header values. Slack and Discord URLs are secrets themselves.
 
 ## Webhook payload
 
-The Worker sends a `POST` to each URL in `WEBHOOK_URLS` (comma-separated) with `Content-Type: application/json`. If `WEBHOOK_AUTH` is set, it's sent as the `Authorization` header (e.g. `Bearer <key>`).
+The Worker sends a `POST` to every registered webhook at once, each with its own headers. A webhook's `format` picks the body:
+
+| `format` | Body |
+|---|---|
+| `json` | The payload below, `Content-Type: application/json`. For bots. |
+| `slack` | `{"text": "…"}` |
+| `discord` | `{"content": "…"}` |
+| `text` | The plain sentence, `text/plain` (e.g. ntfy). |
+
+For `slack`, `discord` and `text`, a reminder reads "AdGuard DNS protection is off for MacBook Pro (1h). It turns back on automatically in ~5 min. Snooze or turn it on: <link>". The link opens the page with both buttons, so a plain notification is enough without a bot.
 
 ```json
 {
@@ -141,7 +171,8 @@ The Worker sends a `POST` to each URL in `WEBHOOK_URLS` (comma-separated) with `
   "off": [
     { "kind": "device", "id": "<device-id>", "name": "MacBook Pro" }
   ],
-  "snooze": { "method": "POST", "url": "https://<worker>/snooze?code=…", "params": { "minutes": "integer, default 60" } }
+  "snooze": { "method": "POST", "url": "https://<worker>/snooze?code=…", "params": { "minutes": "integer, default 60" } },
+  "turn_on": { "method": "POST", "url": "https://<worker>/turn-on?code=…" }
 }
 ```
 
@@ -165,11 +196,11 @@ Save these in the bot's own instructions (not in the webhook):
 > For webhooks from `adguard-protection-watch`:
 > - `event: "reminder"`: send me the `message`.
 > - If I then reply "snooze" or "snooze <duration>": convert the duration to whole minutes (default 60) and send an HTTP **POST** to the `snooze.url` from the most recent reminder, with `&minutes=<N>` added to the end. Then tell me when the next reminder will come (now + the snooze minutes). Don't say protection turns back on at that time: when the snooze ends I get a new reminder, and protection only turns on by itself if I don't answer that one.
-> - If I reply "turn on": for every item in the most recent reminder's `off` list, set `protection_enabled=true` using your AdGuard DNS API access. `kind: "server"` → `PUT /dns_servers/{id}/settings`. `kind: "device"` → `PUT /devices/{id}/settings`. Then tell me which ones you turned on.
+> - If I reply "turn on": send an HTTP **POST** to the `turn_on.url` from the most recent reminder, then tell me the names in its `turned_on` list. (A bot with its own AdGuard DNS API access can instead set `protection_enabled=true` on every item in the reminder's `off` list: `kind: "server"` → `PUT /dns_servers/{id}/settings`, `kind: "device"` → `PUT /devices/{id}/settings`.)
 > - If my reply is unclear, do nothing (protection turns back on by itself).
-> - `event: "auto_enabled"`: send me the `message`. No action needed.
+> - `event: "auto_enabled"` or `event: "test"`: send me the `message`. No action needed.
 
-If the bot can only forward messages, it still works: tap the snooze link and press the button on the page, or flip the toggle yourself. Doing nothing is safe, because protection comes back on by itself.
+If the bot can only forward messages, it still works: tap the snooze link and press a button on the page, or flip the toggle yourself. Doing nothing is safe, because protection comes back on by itself.
 
 ## Configuration
 
@@ -182,9 +213,8 @@ If the bot can only forward messages, it still works: tap the snooze link and pr
 | cron | trigger | yes | `*/5 * * * *` |
 | `ADGUARD_DNS_API_KEY` | secret | **no** | AdGuard DNS API key |
 | `ADGUARD_SERVER_ID` | secret | **no** | ID of the DNS server to watch (from `GET /oapi/v1/dns_servers`) |
-| `WEBHOOK_URLS` | secret | **no** | Webhook URL(s), comma-separated. Anyone holding one can message the bot. |
-| `WEBHOOK_AUTH` | secret | **no** | Optional `Authorization` header value for the webhook, e.g. `Bearer <key>` |
-| `PUBLIC_URL` | secret | **no** | The Worker's own URL (e.g. `https://adguard-protection-watch.<subdomain>.workers.dev`), used to build snooze links. A cron run has no request URL to derive it from. Without it, reminders omit `snooze`. |
+| `ADMIN_TOKEN` | secret | **no** | Bearer token for the `/webhooks` endpoints. A long random string. |
+| `PUBLIC_URL` | secret | **no** | The Worker's own URL (e.g. `https://adguard-protection-watch.<subdomain>.workers.dev`), used to build snooze and turn-on links. A cron run has no request URL to derive it from. Without it, reminders omit `snooze` and `turn_on`. |
 
 ## Repo and deploy
 
@@ -196,10 +226,10 @@ If the bot can only forward messages, it still works: tap the snooze link and pr
 adguard-protection-watch/
   src/index.ts          # scheduled() + fetch(), the fail-safe
   src/adguard.ts        # get/set protection
-  src/watch-keeper.ts   # Durable Object that owns the Watch: check(), snooze(), watch()
-  src/domain.ts         # Watch state machine: decide(), applySnooze() (pure)
+  src/watch-keeper.ts   # Durable Object that owns the Watch and the webhook list
+  src/domain.ts         # Watch state machine: decide(), applySnooze(), checkCode() (pure)
   src/config.ts         # env → typed settings, with defaults
-  src/webhook.ts        # payloads + delivery
+  src/webhook.ts        # messages, formats, delivery, webhook validation
   test/domain.test.ts   # pure reducer tests
   test/worker.test.ts   # real scheduled/fetch handlers, miniflare Durable Object, stubbed AdGuard + webhook
                         # vitest 4 + @cloudflare/vitest-plugin (the renamed vitest-pool-workers)
@@ -240,6 +270,15 @@ Unit tests use a mocked AdGuard API, a mocked webhook, and a fake clock.
 - Wrong code returns 404 and no pending reminder returns 410. In both cases state is unchanged and auto turn-on still happens.
 - A GET never changes state.
 - AdGuard API error: no state change, nothing thrown.
+- Corrupt webhook list, or no webhooks at all: the reminder is still recorded and protection is turned on on schedule.
+- Every storage read throws: protection turned on.
+
+**Webhooks and turn-on:**
+- `/webhooks` answers 404 without `ADMIN_TOKEN` and 401 with a wrong token.
+- Adding sends a test message; a failed test (422) or invalid input (400) saves nothing. The list never shows URL paths or header values.
+- The same URL replaces its entry; the list caps at 20; deleting stops messages.
+- Each webhook gets only its own headers. `slack`, `discord` and `text` bodies carry the link page.
+- `POST /turn-on` turns protection on and retires the code; a failed switch keeps the reminder; AdGuard down returns 502; a GET never acts.
 
 **Concurrency:**
 - A snooze sent while the reminder webhook is still being delivered succeeds.
@@ -253,8 +292,8 @@ Unit tests use a mocked AdGuard API, a mocked webhook, and a fake clock.
 3. Reply "snooze 5m". The next reminder should arrive about 5 minutes after the snooze ends.
 4. Ignore it. Protection should come back on within about 5 minutes, with an `auto_enabled` message.
 5. Turn protection off again, wait for the reminder, and reply "turn on". The bot should turn protection on, and the next check should clear the state.
-6. Temporarily set `WEBHOOK_URLS` to an address that doesn't work, turn protection off, and wait. Protection should come back on with no reminder.
-7. Set the timers back to 60 and 5, restore `WEBHOOK_URLS`, and deploy again.
+6. Remove every webhook (`DELETE /webhooks/{id}`), turn protection off, and wait. Protection should come back on with no reminder.
+7. Set the timers back to 60 and 5, add the webhooks back, and deploy again.
 
 ## Verified (2026-11-04)
 
@@ -293,6 +332,7 @@ These were tested against a real AdGuard DNS account (one server, three devices)
 6. Run the end-to-end check above.
 7. Add the bot rules to the bot.
 8. Deploy the Durable Object version while protection is on (the Durable Object starts empty, so a timer running in KV would restart). Rerun the snooze step of the end-to-end check with a snooze sent within a minute of the reminder. Then delete the old KV namespace.
+9. Webhook list: set `ADMIN_TOKEN`, deploy, add the existing bot through `POST /webhooks`, then delete the old `WEBHOOK_URLS` and `WEBHOOK_AUTH` secrets.
 
 ## Out of scope
 
@@ -300,7 +340,7 @@ These were tested against a real AdGuard DNS account (one server, three devices)
 - Separate timers, snoozes or replies per device (one shared timer instead).
 - The account-wide Home toggle. The public API can't see it; use a server or device toggle instead.
 - Watching more than one DNS server.
-- Built-in notification services (Pushover, ntfy, email). The webhook can point at any of them.
+- Notification services that need more than a single POST (email, Pushover's form fields). The four formats cover the rest.
 - Quiet hours.
 - AdGuard API outages: that's AdGuard's problem, not this tool's. The Worker only retries at the next check, and errors go to the Worker logs with no alert.
 - CI or automated deploys.

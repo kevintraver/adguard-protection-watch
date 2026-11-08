@@ -1,5 +1,4 @@
 ADGUARD_DNS_API_KEY=your-adguard-dns-api-key
 ADGUARD_SERVER_ID=your-dns-server-id
-WEBHOOK_URLS=https://example.com/webhook
-WEBHOOK_AUTH=Bearer your-webhook-key
 PUBLIC_URL=https://adguard-protection-watch.your-subdomain.workers.dev
+ADMIN_TOKEN=a-long-random-string

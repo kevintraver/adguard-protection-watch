@@ -64,16 +64,28 @@ export type SnoozeResult =
   | { type: "no_pending" }
   | { type: "bad_code" };
 
+export type CodeCheck =
+  | { type: "ok"; watch: Extract<Watch, { phase: "reminded" }> }
+  | { type: "no_pending" }
+  | { type: "bad_code" };
+
+/** A reminder's code works once, and only while that reminder is pending. */
+export function checkCode(watch: Watch | null, code: string | null): CodeCheck {
+  if (watch?.phase !== "reminded") return { type: "no_pending" };
+  if (code !== watch.snoozeCode) return { type: "bad_code" };
+  return { type: "ok", watch };
+}
+
 export function applySnooze(
   watch: Watch | null,
   code: string | null,
   minutes: number,
   now: number,
 ): SnoozeResult {
-  if (watch?.phase !== "reminded") return { type: "no_pending" };
-  if (code !== watch.snoozeCode) return { type: "bad_code" };
+  const checked = checkCode(watch, code);
+  if (checked.type !== "ok") return checked;
   return {
     type: "ok",
-    next: { phase: "snoozed", offSince: watch.offSince, snoozeUntil: now + minutes * MINUTE },
+    next: { phase: "snoozed", offSince: checked.watch.offSince, snoozeUntil: now + minutes * MINUTE },
   };
 }

@@ -3,7 +3,7 @@ import type { Config } from "./domain";
 export type Settings = {
   timing: Config;
   adguard: { apiKey: string; serverId: string };
-  webhook: { urls: string[]; auth: string | null };
+  adminToken: string | null;
   publicUrl: string | null;
 };
 
@@ -29,10 +29,7 @@ export function parseSettings(bindings: object): Settings {
       defaultSnoozeMin: parseMinutes(env.DEFAULT_SNOOZE_MIN) ?? 60,
     },
     adguard: { apiKey: text("ADGUARD_DNS_API_KEY"), serverId: text("ADGUARD_SERVER_ID") },
-    webhook: {
-      urls: text("WEBHOOK_URLS").split(",").map((url) => url.trim()).filter(Boolean),
-      auth: text("WEBHOOK_AUTH") || null,
-    },
+    adminToken: text("ADMIN_TOKEN") || null,
     publicUrl: URL.canParse(text("PUBLIC_URL")) ? text("PUBLIC_URL") : null,
   };
 }
