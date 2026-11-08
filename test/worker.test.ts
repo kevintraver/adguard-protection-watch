@@ -628,8 +628,8 @@ describe("other routes", () => {
 });
 
 describe("webhook registry", () => {
-  it("hides the endpoints when WEBHOOKS_ADMIN_TOKEN is unset, and refuses a wrong token", async () => {
-    expect((await admin("GET", "/webhooks", ADMIN, bindings({ WEBHOOKS_ADMIN_TOKEN: "" }))).status).toBe(404);
+  it("hides the endpoints when ADGUARD_WATCH_WEBHOOKS_TOKEN is unset, and refuses a wrong token", async () => {
+    expect((await admin("GET", "/webhooks", ADMIN, bindings({ ADGUARD_WATCH_WEBHOOKS_TOKEN: "" }))).status).toBe(404);
     expect((await admin("GET", "/webhooks", { Authorization: "Bearer wrong" })).status).toBe(401);
     expect((await admin("GET", "/webhooks", {})).status).toBe(401);
     expect((await register({ name: "Sneaky", url: "https://bot2.test/x" }, { Authorization: "Bearer wrong" })).status).toBe(401);

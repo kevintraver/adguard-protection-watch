@@ -24,7 +24,7 @@ You need an AdGuard DNS API key and a Cloudflare API token from the "Edit Cloudf
    fnox exec -- npx wrangler secret put ADGUARD_DNS_API_KEY
    fnox exec -- npx wrangler secret put ADGUARD_SERVER_ID
    fnox exec -- npx wrangler secret put PUBLIC_URL
-   fnox exec -- npx wrangler secret put WEBHOOKS_ADMIN_TOKEN
+   fnox exec -- npx wrangler secret put ADGUARD_WATCH_WEBHOOKS_TOKEN
    ```
 
    | Secret | Value |
@@ -32,7 +32,7 @@ You need an AdGuard DNS API key and a Cloudflare API token from the "Edit Cloudf
    | `ADGUARD_DNS_API_KEY` | Your AdGuard DNS API key. |
    | `ADGUARD_SERVER_ID` | The ID of the DNS server to watch, from `GET /oapi/v1/dns_servers`. |
    | `PUBLIC_URL` | The Worker's own URL, such as `https://adguard-protection-watch.<subdomain>.workers.dev`. Reminders use it to build the snooze link. |
-   | `WEBHOOKS_ADMIN_TOKEN` | A long random string, such as the output of `openssl rand -hex 32`. It guards the `/webhooks` endpoints. |
+   | `ADGUARD_WATCH_WEBHOOKS_TOKEN` | A long random string, such as the output of `openssl rand -hex 32`. It guards the `/webhooks` endpoints. |
 
 3. Deploy.
 
@@ -46,11 +46,11 @@ You need an AdGuard DNS API key and a Cloudflare API token from the "Edit Cloudf
 
    ```sh
    curl -X POST https://adguard-protection-watch.<subdomain>.workers.dev/webhooks \
-     -H "Authorization: Bearer $WEBHOOKS_ADMIN_TOKEN" -H "Content-Type: application/json" \
+     -H "Authorization: Bearer $ADGUARD_WATCH_WEBHOOKS_TOKEN" -H "Content-Type: application/json" \
      -d '{"name": "My bot", "url": "https://…", "headers": {"Authorization": "Bearer …"}}'
    ```
 
-   `headers` is optional and goes only to that webhook. `format` is `json` (the default, for bots), `slack`, `discord` or `text` (plain text, such as ntfy). `GET /webhooks` lists them and `DELETE /webhooks/{id}` removes one. A bot that holds `WEBHOOKS_ADMIN_TOKEN` can add itself. Posting the same URL again updates that entry. See [Managing webhooks](PLAN.md#managing-webhooks).
+   `headers` is optional and goes only to that webhook. `format` is `json` (the default, for bots), `slack`, `discord` or `text` (plain text, such as ntfy). `GET /webhooks` lists them and `DELETE /webhooks/{id}` removes one. A bot that holds `ADGUARD_WATCH_WEBHOOKS_TOKEN` can add itself. Posting the same URL again updates that entry. See [Managing webhooks](PLAN.md#managing-webhooks).
 
 5. For a bot, save the bot rules from [PLAN.md](PLAN.md#bot-rules) in the bot's own instructions. The webhook carries data only, so the bot needs those rules to act on a reply. Slack, Discord and text messages carry a link to a page with "Turn protection on now" and "Snooze" buttons instead.
 
