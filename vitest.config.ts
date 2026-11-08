@@ -10,7 +10,7 @@ export default defineConfig({
         bindings: {
           ADGUARD_DNS_API_KEY: "test-api-key",
           ADGUARD_SERVER_ID: "srv1",
-          ADMIN_TOKEN: "test-admin-token",
+          WEBHOOKS_ADMIN_TOKEN: "test-admin-token",
           PUBLIC_URL: "https://watch.test",
         },
       },

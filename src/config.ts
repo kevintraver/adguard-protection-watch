@@ -29,7 +29,7 @@ export function parseSettings(bindings: object): Settings {
       defaultSnoozeMin: parseMinutes(env.DEFAULT_SNOOZE_MIN) ?? 60,
     },
     adguard: { apiKey: text("ADGUARD_DNS_API_KEY"), serverId: text("ADGUARD_SERVER_ID") },
-    adminToken: text("ADMIN_TOKEN") || null,
+    adminToken: text("WEBHOOKS_ADMIN_TOKEN") || null,
     publicUrl: URL.canParse(text("PUBLIC_URL")) ? text("PUBLIC_URL") : null,
   };
 }

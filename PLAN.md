@@ -136,11 +136,11 @@ If a reminder code is wrong or missing, the Worker returns `404`. If no reminder
 
 ### Managing webhooks
 
-The `/webhooks` endpoints need `Authorization: Bearer <ADMIN_TOKEN>`. Without the `ADMIN_TOKEN` secret they answer `404`. The token guards more than the list: whoever holds a webhook receives snooze codes and could keep snoozing, so only someone you trust should be able to add one.
+The `/webhooks` endpoints need `Authorization: Bearer <WEBHOOKS_ADMIN_TOKEN>`. Without the `WEBHOOKS_ADMIN_TOKEN` secret they answer `404`. The token guards more than the list: whoever holds a webhook receives snooze codes and could keep snoozing, so only someone you trust should be able to add one.
 
 ```sh
 curl -X POST https://<worker>/webhooks \
-  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $WEBHOOKS_ADMIN_TOKEN" -H "Content-Type: application/json" \
   -d '{"name": "Grok bot", "url": "https://…", "headers": {"Authorization": "Bearer …"}, "format": "json"}'
 ```
 
@@ -213,7 +213,7 @@ If the bot can only forward messages, it still works: tap the snooze link and pr
 | cron | trigger | yes | `*/5 * * * *` |
 | `ADGUARD_DNS_API_KEY` | secret | **no** | AdGuard DNS API key |
 | `ADGUARD_SERVER_ID` | secret | **no** | ID of the DNS server to watch (from `GET /oapi/v1/dns_servers`) |
-| `ADMIN_TOKEN` | secret | **no** | Bearer token for the `/webhooks` endpoints. A long random string. |
+| `WEBHOOKS_ADMIN_TOKEN` | secret | **no** | Bearer token for the `/webhooks` endpoints. A long random string. |
 | `PUBLIC_URL` | secret | **no** | The Worker's own URL (e.g. `https://adguard-protection-watch.<subdomain>.workers.dev`), used to build snooze and turn-on links. A cron run has no request URL to derive it from. Without it, reminders omit `snooze` and `turn_on`. |
 
 ## Repo and deploy
@@ -274,7 +274,7 @@ Unit tests use a mocked AdGuard API, a mocked webhook, and a fake clock.
 - Every storage read throws: protection turned on.
 
 **Webhooks and turn-on:**
-- `/webhooks` answers 404 without `ADMIN_TOKEN` and 401 with a wrong token.
+- `/webhooks` answers 404 without `WEBHOOKS_ADMIN_TOKEN` and 401 with a wrong token.
 - Adding sends a test message; a failed test (422) or invalid input (400) saves nothing. The list never shows URL paths or header values.
 - The same URL replaces its entry; the list caps at 20; deleting stops messages.
 - Each webhook gets only its own headers. `slack`, `discord` and `text` bodies carry the link page.
@@ -332,7 +332,7 @@ These were tested against a real AdGuard DNS account (one server, three devices)
 6. Run the end-to-end check above.
 7. Add the bot rules to the bot.
 8. Deploy the Durable Object version while protection is on (the Durable Object starts empty, so a timer running in KV would restart). Rerun the snooze step of the end-to-end check with a snooze sent within a minute of the reminder. Then delete the old KV namespace.
-9. Webhook list: set `ADMIN_TOKEN`, deploy, add the existing bot through `POST /webhooks`, then delete the old `WEBHOOK_URLS` and `WEBHOOK_AUTH` secrets.
+9. Webhook list: set `WEBHOOKS_ADMIN_TOKEN`, deploy, add the existing bot through `POST /webhooks`, then delete the old `WEBHOOK_URLS` and `WEBHOOK_AUTH` secrets.
 
 ## Out of scope
 
