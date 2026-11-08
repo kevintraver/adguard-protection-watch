@@ -218,6 +218,7 @@ describe("normal flow", () => {
           params: { minutes: "integer, default 60" },
         },
         turn_on: { method: "POST", url: `https://watch.test/turn-on?code=${state?.snoozeCode}` },
+        sent_at: "2026-11-04T20:00:00.000Z",
       },
     });
   });
@@ -235,6 +236,7 @@ describe("normal flow", () => {
       message: "No reply, so AdGuard DNS protection is back on for MacBook Pro.",
       off_since: "2026-11-04T19:00:00.000Z",
       off: [{ kind: "device", id: "d1", name: "MacBook Pro" }],
+      sent_at: "2026-11-04T20:05:00.000Z",
     });
     expect(await stored()).toBeNull();
   });
@@ -440,6 +442,7 @@ describe("fail-safe", () => {
       event: "auto_enabled",
       message: "The protection check hit an error, so AdGuard DNS protection is back on for MacBook Pro.",
       off: [{ kind: "device", id: "d1", name: "MacBook Pro" }],
+      sent_at: "2026-11-04T19:00:00.000Z",
     });
   });
 
@@ -641,6 +644,7 @@ describe("webhook registry", () => {
   });
 
   it("sends a test message, saves the webhook, and lists it without its URL path or header values", async () => {
+    vi.setSystemTime(T0);
     const res = await register({ name: "Slack", url: "https://bot2.test/secret-path", format: "slack", headers: { "X-Key": "k" } });
     expect(res.status).toBe(201);
     expect(world.webhooks).toEqual([
@@ -648,7 +652,7 @@ describe("webhook registry", () => {
         url: "https://bot2.test/secret-path",
         auth: null,
         contentType: "application/json",
-        payload: { text: 'AdGuard Protection Watch will send its reminders for "Slack" here.' },
+        payload: { text: 'AdGuard Protection Watch will send its reminders for "Slack" here. (sent 19:00:00 UTC)' },
       },
     ]);
     const list = await (await admin("GET", "/webhooks")).json<Record<string, unknown>[]>();
@@ -754,6 +758,7 @@ describe("signed webhooks", () => {
 
 describe("test endpoint", () => {
   it("reads AdGuard and sends a test message to every webhook with its own headers and format", async () => {
+    vi.setSystemTime(T0);
     await register({ name: "Slack", url: "https://bot2.test/x", format: "slack", headers: { "X-Key": "k" } });
     world.webhooks = [];
     world.setOff("d1");
@@ -771,8 +776,8 @@ describe("test endpoint", () => {
     });
     const text = "Test from AdGuard Protection Watch: this webhook works, and AdGuard DNS protection is off for MacBook Pro.";
     expect(world.webhooks.map(({ url, payload }) => ({ url, payload }))).toEqual([
-      { url: "https://bot.test/hook", payload: { event: "test", message: text } },
-      { url: "https://bot2.test/x", payload: { text } },
+      { url: "https://bot.test/hook", payload: { event: "test", message: text, sent_at: "2026-11-04T19:00:00.000Z" } },
+      { url: "https://bot2.test/x", payload: { text: `${text} (sent 19:00:00 UTC)` } },
     ]);
     expect(await stored()).toBeNull();
     expect(world.puts).toEqual([]);
@@ -816,7 +821,7 @@ describe("message formats", () => {
     expect(sent.contentType).toBe(contentType);
     expect(sent.payload).toEqual(
       shape(
-        `AdGuard DNS protection is off for MacBook Pro (1h). It turns back on automatically in ~5 min. Snooze or turn it on: https://watch.test/snooze?code=${code}`,
+        `AdGuard DNS protection is off for MacBook Pro (1h). It turns back on automatically in ~5 min. Snooze or turn it on: https://watch.test/snooze?code=${code} (sent 20:00:00 UTC)`,
       ),
     );
   });
